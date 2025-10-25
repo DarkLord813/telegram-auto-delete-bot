@@ -132,7 +132,20 @@ class KeepAliveService:
 class AutoDeleteBot:
     def __init__(self, token: str):
         self.token = token
-        self.application = Application.builder().token(token).build()
+        
+        # Fixed Application initialization
+        try:
+            self.application = (
+                Application.builder()
+                .token(token)
+                .concurrent_updates(True)
+                .build()
+            )
+            logger.info("✅ Application initialized successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize Application: {e}")
+            raise
+        
         self.setup_database()
         
         # Store admin lists and settings
@@ -993,6 +1006,11 @@ if __name__ == "__main__":
         logger.error("❌ BOT_TOKEN environment variable is required!")
         exit(1)
     
-    # Create and run the bot
-    bot = AutoDeleteBot(BOT_TOKEN)
-    bot.run()
+    try:
+        # Create and run the bot
+        bot = AutoDeleteBot(BOT_TOKEN)
+        logger.info("✅ Bot initialized successfully, starting...")
+        bot.run()
+    except Exception as e:
+        logger.error(f"❌ Failed to start bot: {e}")
+        exit(1)
