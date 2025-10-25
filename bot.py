@@ -133,12 +133,12 @@ class AutoDeleteBot:
     def __init__(self, token: str):
         self.token = token
         
-        # Fixed Application initialization
+        # Fixed Application initialization for python-telegram-bot v20.x
         try:
             self.application = (
                 Application.builder()
                 .token(token)
-                .concurrent_updates(True)
+                .post_init(self.post_init)
                 .build()
             )
             logger.info("✅ Application initialized successfully")
@@ -154,20 +154,7 @@ class AutoDeleteBot:
         self.delete_intervals: Dict[str, int] = {}
         
         # Add handlers
-        self.application.add_handler(CommandHandler("start", self.start_command))
-        self.application.add_handler(CommandHandler("setup", self.setup_command))
-        self.application.add_handler(CommandHandler("addadmin", self.add_admin_command))
-        self.application.add_handler(CommandHandler("removeadmin", self.remove_admin_command))
-        self.application.add_handler(CommandHandler("listadmins", self.list_admins_command))
-        self.application.add_handler(CommandHandler("settings", self.settings_command))
-        self.application.add_handler(CommandHandler("setinterval", self.set_interval_command))
-        self.application.add_handler(CommandHandler("stats", self.stats_command))
-        
-        # Callback query handler for inline keyboards
-        self.application.add_handler(CallbackQueryHandler(self.handle_callback_query))
-        
-        # Message handler for all messages
-        self.application.add_handler(MessageHandler(filters.ALL, self.handle_message))
+        self.setup_handlers()
         
         # Store the bot instance
         self.bot = Bot(token=token)
@@ -187,6 +174,30 @@ class AutoDeleteBot:
         self.load_channel_data()
         
         logger.info("🤖 Auto Delete Bot initialized")
+
+    async def post_init(self, application: Application):
+        """Post initialization callback"""
+        logger.info("🔄 Application post-init completed")
+
+    def setup_handlers(self):
+        """Setup all message handlers"""
+        # Command handlers
+        self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(CommandHandler("setup", self.setup_command))
+        self.application.add_handler(CommandHandler("addadmin", self.add_admin_command))
+        self.application.add_handler(CommandHandler("removeadmin", self.remove_admin_command))
+        self.application.add_handler(CommandHandler("listadmins", self.list_admins_command))
+        self.application.add_handler(CommandHandler("settings", self.settings_command))
+        self.application.add_handler(CommandHandler("setinterval", self.set_interval_command))
+        self.application.add_handler(CommandHandler("stats", self.stats_command))
+        
+        # Callback query handler for inline keyboards
+        self.application.add_handler(CallbackQueryHandler(self.handle_callback_query))
+        
+        # Message handler for all messages
+        self.application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.handle_message))
+        
+        logger.info("✅ All handlers setup completed")
 
     def setup_database(self):
         """Initialize SQLite database for storing settings"""
@@ -994,7 +1005,7 @@ Use the menus above or contact the bot administrator.
         
         # Start the bot
         logger.info("🤖 Starting Auto Delete Bot...")
-        self.application.run_polling()
+        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 # ==================== MAIN EXECUTION ====================
 
