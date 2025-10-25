@@ -4,11 +4,11 @@ import logging
 import sqlite3
 import requests
 import threading
+import asyncio
 from datetime import datetime
 from typing import Dict, List
-
 from telegram import Bot, Update, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, CallbackContext, MessageHandler, Filters, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 from telegram.error import TelegramError, BadRequest
 from flask import Flask, jsonify
 from threading import Thread
@@ -64,10 +64,10 @@ class KeepAliveService:
                 try:
                     response = requests.get(self.health_url, timeout=10)
                     if response.status_code == 200:
-                        logger.info(f"Keep-alive ping successful")
+                        logger.info(f"Keep-alive ping: {datetime.now().strftime('%H:%M:%S')}")
                 except Exception as e:
                     logger.warning(f"Keep-alive error: {e}")
-                time.sleep(300)  # 5 minutes
+                time.sleep(300)
         
         thread = threading.Thread(target=ping_loop, daemon=True)
         thread.start()
@@ -79,10 +79,13 @@ class AutoDeleteBot:
     def __init__(self, token: str):
         self.token = token
         
-        # Use Updater for python-telegram-bot v13.x
-        self.updater = Updater(token=token, use_context=True)
-        self.dispatcher = self.updater.dispatcher
-        self.bot = self.updater.bot
+        # Simple Application initialization for python-telegram-bot v20.x
+        try:
+            self.application = Application.builder().token(token).build()
+            logger.info("✅ Application initialized successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize Application: {e}")
+            raise
         
         self.setup_database()
         
@@ -94,6 +97,7 @@ class AutoDeleteBot:
         # Setup handlers
         self.setup_handlers()
         
+        self.bot = Bot(token=token)
         self.keep_alive = None
         
         # Statistics
@@ -110,15 +114,15 @@ class AutoDeleteBot:
     def setup_handlers(self):
         """Setup all message handlers"""
         # Command handlers
-        self.dispatcher.add_handler(CommandHandler("start", self.start_command))
-        self.dispatcher.add_handler(CommandHandler("setup", self.setup_command))
-        self.dispatcher.add_handler(CommandHandler("stats", self.stats_command))
+        self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(CommandHandler("setup", self.setup_command))
+        self.application.add_handler(CommandHandler("stats", self.stats_command))
         
         # Callback query handler
-        self.dispatcher.add_handler(CallbackQueryHandler(self.handle_callback_query))
+        self.application.add_handler(CallbackQueryHandler(self.handle_callback_query))
         
         # Message handler for all messages
-        self.dispatcher.add_handler(MessageHandler(Filters.all, self.handle_message))
+        self.application.add_handler(MessageHandler(filters.ALL, self.handle_message))
 
     def setup_database(self):
         """Initialize SQLite database"""
@@ -211,7 +215,7 @@ class AutoDeleteBot:
 
     # ==================== COMMAND HANDLERS ====================
 
-    def start_command(self, update: Update, context: CallbackContext):
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         welcome_text = """
 🤖 **Auto Delete Bot**
 
@@ -224,9 +228,9 @@ I automatically delete ALL messages except those from specified admins in channe
 
 Use the buttons below to get started!
         """
-        update.message.reply_text(welcome_text, parse_mode='Markdown', reply_markup=self.create_main_menu_keyboard())
+        await update.message.reply_text(welcome_text, parse_mode='Markdown', reply_markup=self.create_main_menu_keyboard())
 
-    def setup_command(self, update: Update, context: CallbackContext):
+    async def setup_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         setup_text = """
 🛠️ **Bot Setup**
 
@@ -238,9 +242,9 @@ To setup auto-deletion in your channel:
 
 I will only delete messages sent after I was added to the channel.
         """
-        update.message.reply_text(setup_text, parse_mode='Markdown', reply_markup=self.create_setup_keyboard())
+        await update.message.reply_text(setup_text, parse_mode='Markdown', reply_markup=self.create_setup_keyboard())
 
-    def stats_command(self, update: Update, context: CallbackContext):
+    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         uptime = datetime.now() - self.stats['start_time']
         uptime_str = f"{uptime.days}d {uptime.seconds//3600}h {(uptime.seconds//60)%60}m"
         
@@ -253,47 +257,47 @@ I will only delete messages sent after I was added to the channel.
 **Messages Deleted:** {self.stats['messages_deleted']:,}
 **Errors:** {self.stats['errors']:,}
         """
-        update.message.reply_text(stats_text, parse_mode='Markdown', reply_markup=self.create_back_keyboard())
+        await update.message.reply_text(stats_text, parse_mode='Markdown', reply_markup=self.create_back_keyboard())
 
-    def handle_callback_query(self, update: Update, context: CallbackContext):
+    async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
-        query.answer()
+        await query.answer()
         
         callback_data = query.data
         logger.info(f"Callback received: {callback_data}")
         
         if callback_data == "main_menu":
-            self.show_main_menu(query)
+            await self.show_main_menu(query)
         elif callback_data == "setup_bot":
-            self.show_setup_menu(query)
+            await self.show_setup_menu(query)
         elif callback_data == "confirm_setup":
-            self.confirm_setup(query, context)
+            await self.confirm_setup(query, context)
         elif callback_data == "show_stats":
-            self.show_stats(query)
+            await self.show_stats(query)
         elif callback_data == "show_help":
-            self.show_help(query)
+            await self.show_help(query)
 
-    def show_main_menu(self, query):
+    async def show_main_menu(self, query):
         welcome_text = "🤖 **Auto Delete Bot - Main Menu**\n\nChoose an option below:"
-        query.edit_message_text(welcome_text, parse_mode='Markdown', reply_markup=self.create_main_menu_keyboard())
+        await query.edit_message_text(welcome_text, parse_mode='Markdown', reply_markup=self.create_main_menu_keyboard())
 
-    def show_setup_menu(self, query):
+    async def show_setup_menu(self, query):
         setup_text = "🛠️ **Setup Auto-Deletion**\n\nClick Confirm Setup to configure the bot in this channel."
-        query.edit_message_text(setup_text, parse_mode='Markdown', reply_markup=self.create_setup_keyboard())
+        await query.edit_message_text(setup_text, parse_mode='Markdown', reply_markup=self.create_setup_keyboard())
 
-    def confirm_setup(self, query: Update, context: CallbackContext):
+    async def confirm_setup(self, query: Update, context: ContextTypes.DEFAULT_TYPE):
         chat = query.message.chat
         
         # Check if in a channel/group
         if chat.type not in ['channel', 'group', 'supergroup']:
-            query.edit_message_text("❌ Please use this command in a channel or group where you want to setup auto-deletion.", reply_markup=self.create_back_keyboard())
+            await query.edit_message_text("❌ Please use this command in a channel or group where you want to setup auto-deletion.", reply_markup=self.create_back_keyboard())
             return
 
         try:
             # Check if bot is admin
-            bot_member = chat.get_member(self.bot.id)
+            bot_member = await chat.get_member(self.bot.id)
             if bot_member.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
-                query.edit_message_text(
+                await query.edit_message_text(
                     "❌ I need to be an **admin** in this channel with **delete messages** permission.\n\nPlease make me an admin first, then try setup again.",
                     parse_mode='Markdown',
                     reply_markup=self.create_back_keyboard()
@@ -301,13 +305,13 @@ I will only delete messages sent after I was added to the channel.
                 return
                 
             # Check if user is admin
-            user_member = chat.get_member(query.from_user.id)
+            user_member = await chat.get_member(query.from_user.id)
             if user_member.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
-                query.edit_message_text("❌ You need to be an admin in this channel to setup the bot.", reply_markup=self.create_back_keyboard())
+                await query.edit_message_text("❌ You need to be an admin in this channel to setup the bot.", reply_markup=self.create_back_keyboard())
                 return
                 
         except TelegramError as e:
-            query.edit_message_text(f"❌ Error checking permissions: {e}", reply_markup=self.create_back_keyboard())
+            await query.edit_message_text(f"❌ Error checking permissions: {e}", reply_markup=self.create_back_keyboard())
             return
 
         # Setup channel in database
@@ -356,9 +360,9 @@ I will only delete messages sent after I was added to the channel.
 
 The bot is now active and will auto-delete messages from non-approved users.
         """
-        query.edit_message_text(success_text, parse_mode='Markdown', reply_markup=self.create_main_menu_keyboard())
+        await query.edit_message_text(success_text, parse_mode='Markdown', reply_markup=self.create_main_menu_keyboard())
 
-    def show_stats(self, query):
+    async def show_stats(self, query):
         uptime = datetime.now() - self.stats['start_time']
         uptime_str = f"{uptime.days}d {uptime.seconds//3600}h {(uptime.seconds//60)%60}m"
         
@@ -373,9 +377,9 @@ The bot is now active and will auto-delete messages from non-approved users.
 
 **Keep-alive:** {'🟢 Active' if self.keep_alive and self.keep_alive.is_running else '🔴 Inactive'}
         """
-        query.edit_message_text(stats_text, parse_mode='Markdown', reply_markup=self.create_back_keyboard())
+        await query.edit_message_text(stats_text, parse_mode='Markdown', reply_markup=self.create_back_keyboard())
 
-    def show_help(self, query):
+    async def show_help(self, query):
         help_text = """
 ℹ️ **Help & Information**
 
@@ -392,11 +396,11 @@ The bot is now active and will auto-delete messages from non-approved users.
 **Need Help?**
 Contact the bot administrator for assistance.
         """
-        query.edit_message_text(help_text, parse_mode='Markdown', reply_markup=self.create_back_keyboard())
+        await query.edit_message_text(help_text, parse_mode='Markdown', reply_markup=self.create_back_keyboard())
 
     # ==================== MESSAGE HANDLER ====================
 
-    def handle_message(self, update: Update, context: CallbackContext):
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = update.effective_message
         if not message:
             return
@@ -427,25 +431,15 @@ Contact the bot administrator for assistance.
         # Get deletion interval for this channel
         delete_interval = self.delete_intervals.get(channel_id, 300)
         
-        # Schedule deletion
-        try:
-            context.job_queue.run_once(
-                self.delete_message_callback, 
-                delete_interval, 
-                context=message.chat_id,
-                name=f"delete_{message.message_id}"
-            )
-        except Exception as e:
-            logger.error(f"Error scheduling deletion: {e}")
-            self.stats['errors'] += 1
+        # Schedule deletion after delay
+        await asyncio.sleep(delete_interval)
+        await self.delete_message(message)
 
-    def delete_message_callback(self, context: CallbackContext):
-        """Callback for deleting messages"""
-        job = context.job
+    async def delete_message(self, message):
         try:
-            context.bot.delete_message(chat_id=job.context, message_id=job.name.replace("delete_", ""))
+            await message.delete()
             self.stats['messages_deleted'] += 1
-            logger.info(f"Deleted message {job.name} from channel {job.context}")
+            logger.info(f"Deleted message from user {message.from_user.id}")
         except BadRequest as e:
             if "message to delete not found" not in str(e).lower():
                 logger.error(f"Error deleting message: {e}")
@@ -464,9 +458,8 @@ Contact the bot administrator for assistance.
         
         # Start the bot
         logger.info("🤖 Starting Auto Delete Bot...")
-        self.updater.start_polling()
+        self.application.run_polling()
         logger.info("✅ Bot is now running and polling for messages")
-        self.updater.idle()
 
 # ==================== MAIN EXECUTION ====================
 
