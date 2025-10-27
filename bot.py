@@ -6,7 +6,7 @@ import requests
 import threading
 from datetime import datetime, timedelta
 from typing import Dict, List
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from threading import Thread
 
 # Configure logging
@@ -16,9 +16,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== HEALTH CHECK SERVER ====================
+# ==================== FLASK APP ====================
 
 app = Flask(__name__)
+
+# Global bot instance
+BOT_INSTANCE = None
 
 @app.route('/health')
 def health_check():
@@ -28,13 +31,45 @@ def health_check():
 def home():
     return jsonify({'service': 'Telegram Auto Delete Bot', 'status': 'running'})
 
-def run_health_server():
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Webhook endpoint for Telegram"""
+    try:
+        update = request.get_json()
+        logger.info(f"Webhook received: {update.get('update_id')}")
+        
+        if BOT_INSTANCE:
+            BOT_INSTANCE.bot.process_update(update)
+        
+        return 'OK'
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return 'OK'
+
+@app.route('/set_webhook', methods=['GET'])
+def set_webhook():
+    """Manually set webhook URL"""
+    try:
+        if BOT_INSTANCE:
+            webhook_url = f"{os.environ.get('RENDER_EXTERNAL_URL')}/webhook"
+            success = BOT_INSTANCE.set_webhook(webhook_url)
+            if success:
+                return jsonify({'status': 'success', 'webhook_url': webhook_url})
+            else:
+                return jsonify({'status': 'error', 'message': 'Failed to set webhook'}), 500
+        else:
+            return jsonify({'status': 'error', 'message': 'Bot not initialized'}), 500
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+def run_server():
+    """Run the Flask server"""
     try:
         port = int(os.environ.get('PORT', 8080))
-        logger.info(f"Starting health server on port {port}")
+        logger.info(f"Starting server on port {port}")
         app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
     except Exception as e:
-        logger.error(f"Health server error: {e}")
+        logger.error(f"Server error: {e}")
 
 # ==================== DATABASE MANAGER ====================
 
@@ -198,6 +233,23 @@ class TelegramBotHandler:
         except Exception as e:
             logger.error(f"Error getting bot info: {e}")
     
+    def set_webhook(self, webhook_url):
+        """Set webhook URL"""
+        try:
+            response = requests.post(
+                f"{self.bot_url}/setWebhook",
+                json={'url': webhook_url}
+            )
+            if response.status_code == 200:
+                logger.info(f"Webhook set to: {webhook_url}")
+                return True
+            else:
+                logger.error(f"Failed to set webhook: {response.text}")
+                return False
+        except Exception as e:
+            logger.error(f"Error setting webhook: {e}")
+            return False
+    
     def set_user_state(self, user_id, state, data=None):
         """Set user conversation state"""
         self.user_states[user_id] = {'state': state, 'data': data or {}}
@@ -283,13 +335,8 @@ class TelegramBotHandler:
             logger.error(f"Error getting chat member: {e}")
             return None
     
-    def process_updates(self, updates):
-        """Process multiple updates"""
-        for update in updates:
-            self.process_update(update)
-    
     def process_update(self, update):
-        """Process incoming update"""
+        """Process incoming update from webhook"""
         try:
             logger.info(f"Processing update: {update.get('update_id')}")
             
@@ -866,65 +913,6 @@ class DeletionWorker:
         except Exception as e:
             logger.error(f"Error in process_pending_deletions: {e}")
 
-# ==================== BOT POLLING MANAGER ====================
-
-class BotPollingManager:
-    def __init__(self, bot_handler):
-        self.bot = bot_handler
-        self.is_running = False
-        self.last_update_id = 0
-    
-    def start_polling(self):
-        """Start polling with proper single instance management"""
-        self.is_running = True
-        
-        def polling_loop():
-            while self.is_running:
-                try:
-                    # Get updates with long polling
-                    response = requests.get(
-                        f"{self.bot.bot_url}/getUpdates",
-                        params={
-                            'offset': self.last_update_id + 1,
-                            'timeout': 30,
-                            'allowed_updates': ['message', 'callback_query', 'my_chat_member']
-                        },
-                        timeout=35  # Slightly more than timeout parameter
-                    )
-                    
-                    if response.status_code == 200:
-                        data = response.json()
-                        if data['ok']:
-                            updates = data['result']
-                            if updates:
-                                logger.info(f"Received {len(updates)} updates")
-                                self.bot.process_updates(updates)
-                                # Update the last processed update ID
-                                self.last_update_id = max(update['update_id'] for update in updates)
-                        else:
-                            logger.error(f"Telegram API error: {data}")
-                    else:
-                        logger.error(f"HTTP error: {response.status_code} - {response.text}")
-                        time.sleep(10)  # Wait before retry on HTTP error
-                        
-                except requests.exceptions.Timeout:
-                    # Timeout is normal for long polling
-                    continue
-                except requests.exceptions.ConnectionError:
-                    logger.error("Connection error, retrying in 10 seconds...")
-                    time.sleep(10)
-                except Exception as e:
-                    logger.error(f"Unexpected error in polling: {e}")
-                    time.sleep(10)
-        
-        thread = threading.Thread(target=polling_loop, daemon=True)
-        thread.start()
-        logger.info("Bot polling started (single instance)")
-    
-    def stop_polling(self):
-        """Stop polling"""
-        self.is_running = False
-
 # ==================== MAIN APPLICATION ====================
 
 class AutoDeleteBot:
@@ -933,9 +921,12 @@ class AutoDeleteBot:
         self.db = DatabaseManager()
         self.bot = TelegramBotHandler(token, self.db)
         self.worker = DeletionWorker(self.bot, self.db)
-        self.polling_manager = BotPollingManager(self.bot)
         
         logger.info("Auto Delete Bot initialized successfully")
+    
+    def set_webhook(self, webhook_url):
+        """Set webhook URL"""
+        return self.bot.set_webhook(webhook_url)
     
     def start_keep_alive(self):
         """Start keep-alive service"""
@@ -965,29 +956,21 @@ class AutoDeleteBot:
     
     def run(self):
         """Start the bot"""
-        # Start health check server in main thread
-        health_thread = Thread(target=run_health_server, daemon=True)
-        health_thread.start()
-        logger.info("Health server started")
+        # Start deletion worker
+        self.worker.start()
         
         # Start keep-alive
         self.start_keep_alive()
         
-        # Start deletion worker
-        self.worker.start()
+        # Set webhook automatically
+        webhook_url = f"{os.environ.get('RENDER_EXTERNAL_URL')}/webhook"
+        if webhook_url.startswith("https://"):
+            self.set_webhook(webhook_url)
         
-        # Start bot polling (single instance)
-        self.polling_manager.start_polling()
+        logger.info("🤖 Auto Delete Bot is now running with webhooks!")
         
-        logger.info("🤖 Auto Delete Bot is now running!")
-        
-        # Keep main thread alive
-        try:
-            while True:
-                time.sleep(60)
-        except KeyboardInterrupt:
-            logger.info("Bot stopped by user")
-            self.polling_manager.stop_polling()
+        # Run Flask server in main thread (this will block)
+        run_server()
 
 # ==================== MAIN EXECUTION ====================
 
@@ -999,8 +982,11 @@ if __name__ == "__main__":
         exit(1)
     
     try:
-        bot = AutoDeleteBot(BOT_TOKEN)
-        bot.run()
+        # Create global bot instance
+        BOT_INSTANCE = AutoDeleteBot(BOT_TOKEN)
+        
+        # Start the bot
+        BOT_INSTANCE.run()
     except Exception as e:
         logger.error(f"❌ Failed to start bot: {e}")
         exit(1)
