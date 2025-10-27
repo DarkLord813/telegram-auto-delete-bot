@@ -6,7 +6,7 @@ import requests
 import threading
 from datetime import datetime, timedelta
 from typing import Dict, List
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 from threading import Thread
 
 # Configure logging
@@ -28,18 +28,6 @@ def health_check():
 def home():
     return jsonify({'service': 'Telegram Auto Delete Bot', 'status': 'running'})
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """Webhook endpoint for Telegram"""
-    try:
-        update = request.get_json()
-        if BOT_INSTANCE:
-            BOT_INSTANCE.bot.process_update(update)
-        return 'OK'
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return 'OK'
-
 def run_health_server():
     try:
         port = int(os.environ.get('PORT', 8080))
@@ -47,15 +35,6 @@ def run_health_server():
         app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
     except Exception as e:
         logger.error(f"Health server error: {e}")
-        time.sleep(5)
-
-def start_health_check():
-    def health_wrapper():
-        run_health_server()
-    
-    t = Thread(target=health_wrapper, daemon=True)
-    t.start()
-    logger.info("Health check server started")
 
 # ==================== DATABASE MANAGER ====================
 
@@ -304,8 +283,13 @@ class TelegramBotHandler:
             logger.error(f"Error getting chat member: {e}")
             return None
     
+    def process_updates(self, updates):
+        """Process multiple updates"""
+        for update in updates:
+            self.process_update(update)
+    
     def process_update(self, update):
-        """Process incoming update from webhook"""
+        """Process incoming update"""
         try:
             logger.info(f"Processing update: {update.get('update_id')}")
             
@@ -366,7 +350,7 @@ class TelegramBotHandler:
                     return
             
             # Auto-setup the channel
-            self.db.add_channel(chat_id, chat_title)
+            self.db.add_channel(str(chat_id), chat_title)
             
             # Send welcome message
             welcome_text = f"""
@@ -394,8 +378,6 @@ I will automatically delete all messages except those from specified admins.
             message_id = message['message_id']
             chat_type = message['chat']['type']
             
-            logger.info(f"Message in {chat_type} {chat_id} from user {user_id}")
-            
             # Ignore messages from channels (they don't have 'from' field)
             if not user_id:
                 return
@@ -421,7 +403,6 @@ I will automatically delete all messages except those from specified admins.
             
             # Check if user is admin
             if self.db.is_admin(str(chat_id), user_id):
-                logger.info(f"Message from admin {user_id} in {chat_id} - not deleting")
                 return  # Admin can post freely
             
             # Get channel settings
@@ -432,7 +413,6 @@ I will automatically delete all messages except those from specified admins.
             # Check message time (only delete messages after bot was added)
             message_date = datetime.fromtimestamp(message['date'])
             if message_date < channel_settings['bot_added_date']:
-                logger.info(f"Message from before bot was added - not deleting")
                 return  # Message before bot was added
             
             # Schedule deletion
@@ -462,8 +442,6 @@ I will automatically delete all messages except those from specified admins.
         user_id = message['from']['id']
         text = message['text']
         
-        logger.info(f"Command received: {text} from {user_id} in {chat_id}")
-        
         if text == '/start':
             self.send_main_menu(chat_id)
         elif text == '/setup':
@@ -480,8 +458,6 @@ I will automatically delete all messages except those from specified admins.
         chat_id = callback_query['message']['chat']['id']
         user_id = callback_query['from']['id']
         data = callback_query['data']
-        
-        logger.info(f"Callback query: {data} from {user_id}")
         
         # Answer callback query
         requests.post(f"{self.bot_url}/answerCallbackQuery", json={'callback_query_id': callback_query['id']})
@@ -890,6 +866,65 @@ class DeletionWorker:
         except Exception as e:
             logger.error(f"Error in process_pending_deletions: {e}")
 
+# ==================== BOT POLLING MANAGER ====================
+
+class BotPollingManager:
+    def __init__(self, bot_handler):
+        self.bot = bot_handler
+        self.is_running = False
+        self.last_update_id = 0
+    
+    def start_polling(self):
+        """Start polling with proper single instance management"""
+        self.is_running = True
+        
+        def polling_loop():
+            while self.is_running:
+                try:
+                    # Get updates with long polling
+                    response = requests.get(
+                        f"{self.bot.bot_url}/getUpdates",
+                        params={
+                            'offset': self.last_update_id + 1,
+                            'timeout': 30,
+                            'allowed_updates': ['message', 'callback_query', 'my_chat_member']
+                        },
+                        timeout=35  # Slightly more than timeout parameter
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        if data['ok']:
+                            updates = data['result']
+                            if updates:
+                                logger.info(f"Received {len(updates)} updates")
+                                self.bot.process_updates(updates)
+                                # Update the last processed update ID
+                                self.last_update_id = max(update['update_id'] for update in updates)
+                        else:
+                            logger.error(f"Telegram API error: {data}")
+                    else:
+                        logger.error(f"HTTP error: {response.status_code} - {response.text}")
+                        time.sleep(10)  # Wait before retry on HTTP error
+                        
+                except requests.exceptions.Timeout:
+                    # Timeout is normal for long polling
+                    continue
+                except requests.exceptions.ConnectionError:
+                    logger.error("Connection error, retrying in 10 seconds...")
+                    time.sleep(10)
+                except Exception as e:
+                    logger.error(f"Unexpected error in polling: {e}")
+                    time.sleep(10)
+        
+        thread = threading.Thread(target=polling_loop, daemon=True)
+        thread.start()
+        logger.info("Bot polling started (single instance)")
+    
+    def stop_polling(self):
+        """Stop polling"""
+        self.is_running = False
+
 # ==================== MAIN APPLICATION ====================
 
 class AutoDeleteBot:
@@ -898,6 +933,7 @@ class AutoDeleteBot:
         self.db = DatabaseManager()
         self.bot = TelegramBotHandler(token, self.db)
         self.worker = DeletionWorker(self.bot, self.db)
+        self.polling_manager = BotPollingManager(self.bot)
         
         logger.info("Auto Delete Bot initialized successfully")
     
@@ -927,37 +963,12 @@ class AutoDeleteBot:
             logger.error(f"Failed to start keep-alive: {e}")
             return False
     
-    def run_polling(self):
-        """Run with polling"""
-        def poll_loop():
-            offset = 0
-            while True:
-                try:
-                    response = requests.get(
-                        f"{self.bot.bot_url}/getUpdates",
-                        params={'offset': offset, 'timeout': 30, 'allowed_updates': ['message', 'callback_query', 'my_chat_member']}
-                    )
-                    if response.status_code == 200:
-                        updates = response.json()['result']
-                        if updates:
-                            logger.info(f"Received {len(updates)} updates")
-                        for update in updates:
-                            self.bot.process_update(update)
-                            offset = update['update_id'] + 1
-                    else:
-                        logger.error(f"Polling error: {response.text}")
-                except Exception as e:
-                    logger.error(f"Error in polling: {e}")
-                    time.sleep(10)
-        
-        thread = threading.Thread(target=poll_loop, daemon=True)
-        thread.start()
-        logger.info("Polling started")
-    
     def run(self):
         """Start the bot"""
-        # Start health check server
-        start_health_check()
+        # Start health check server in main thread
+        health_thread = Thread(target=run_health_server, daemon=True)
+        health_thread.start()
+        logger.info("Health server started")
         
         # Start keep-alive
         self.start_keep_alive()
@@ -965,8 +976,8 @@ class AutoDeleteBot:
         # Start deletion worker
         self.worker.start()
         
-        # Start bot polling
-        self.run_polling()
+        # Start bot polling (single instance)
+        self.polling_manager.start_polling()
         
         logger.info("🤖 Auto Delete Bot is now running!")
         
@@ -976,10 +987,7 @@ class AutoDeleteBot:
                 time.sleep(60)
         except KeyboardInterrupt:
             logger.info("Bot stopped by user")
-
-# ==================== GLOBAL INSTANCE ====================
-
-BOT_INSTANCE = None
+            self.polling_manager.stop_polling()
 
 # ==================== MAIN EXECUTION ====================
 
@@ -991,8 +999,8 @@ if __name__ == "__main__":
         exit(1)
     
     try:
-        BOT_INSTANCE = AutoDeleteBot(BOT_TOKEN)
-        BOT_INSTANCE.run()
+        bot = AutoDeleteBot(BOT_TOKEN)
+        bot.run()
     except Exception as e:
         logger.error(f"❌ Failed to start bot: {e}")
         exit(1)
