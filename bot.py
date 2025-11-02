@@ -6,7 +6,7 @@ import requests
 import threading
 from datetime import datetime, timedelta
 from typing import Dict, List
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from threading import Thread
 
 # Configure logging
@@ -16,9 +16,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== HEALTH CHECK SERVER ====================
+# ==================== FLASK APP ====================
 
 app = Flask(__name__)
+
+# Global bot instance
+bot_instance = None
 
 @app.route('/health')
 def health_check():
@@ -27,6 +30,26 @@ def health_check():
 @app.route('/')
 def home():
     return jsonify({'service': 'Telegram Auto Delete Bot', 'status': 'running'})
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Main webhook endpoint for Telegram"""
+    try:
+        update = request.get_json()
+        if bot_instance:
+            bot_instance.process_update(update)
+        return 'OK'
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return 'OK'
+
+@app.route('/setup-webhook', methods=['GET'])
+def setup_webhook():
+    """Manually setup webhook"""
+    if bot_instance:
+        success = bot_instance.setup_webhook()
+        return jsonify({'success': success})
+    return jsonify({'success': False, 'error': 'Bot not initialized'})
 
 def run_health_server():
     try:
@@ -171,45 +194,52 @@ class DatabaseManager:
         cursor.execute('SELECT 1 FROM channels WHERE channel_id = ? AND is_active = TRUE', (channel_id,))
         return cursor.fetchone() is not None
 
-# ==================== TELEGRAM BOT HANDLER ====================
+# ==================== TELEGRAM BOT ====================
 
-class TelegramBotHandler:
+class TelegramBot:
     def __init__(self, token, db_manager):
         self.token = token
         self.db = db_manager
         self.bot_url = f"https://api.telegram.org/bot{token}"
         
-        # Store user states for conversation flow
+        # Store user states
         self.user_states = {}
         
-        # Store bot info
-        self.bot_info = None
-        self.get_bot_info()
+        # Get bot info
+        self.bot_info = self.get_bot_info()
+        
+        logger.info(f"Bot initialized: @{self.bot_info['username']}")
     
     def get_bot_info(self):
         """Get bot information"""
         try:
             response = requests.get(f"{self.bot_url}/getMe")
             if response.status_code == 200:
-                self.bot_info = response.json()['result']
-                logger.info(f"Bot initialized: @{self.bot_info['username']} (ID: {self.bot_info['id']})")
+                return response.json()['result']
             else:
                 logger.error("Failed to get bot info")
+                return {'username': 'unknown', 'id': 0}
         except Exception as e:
             logger.error(f"Error getting bot info: {e}")
+            return {'username': 'unknown', 'id': 0}
     
-    def set_user_state(self, user_id, state, data=None):
-        """Set user conversation state"""
-        self.user_states[user_id] = {'state': state, 'data': data or {}}
-    
-    def get_user_state(self, user_id):
-        """Get user conversation state"""
-        return self.user_states.get(user_id)
-    
-    def clear_user_state(self, user_id):
-        """Clear user conversation state"""
-        if user_id in self.user_states:
-            del self.user_states[user_id]
+    def setup_webhook(self):
+        """Setup webhook with Telegram"""
+        try:
+            webhook_url = f"{os.environ.get('RENDER_EXTERNAL_URL')}/webhook"
+            response = requests.post(
+                f"{self.bot_url}/setWebhook",
+                json={'url': webhook_url}
+            )
+            if response.status_code == 200:
+                logger.info(f"Webhook set to: {webhook_url}")
+                return True
+            else:
+                logger.error(f"Failed to set webhook: {response.text}")
+                return False
+        except Exception as e:
+            logger.error(f"Error setting webhook: {e}")
+            return False
     
     def send_message(self, chat_id, text, reply_markup=None, parse_mode='HTML'):
         """Send message to chat"""
@@ -223,11 +253,7 @@ class TelegramBotHandler:
                 data['reply_markup'] = reply_markup
             
             response = requests.post(f"{self.bot_url}/sendMessage", json=data)
-            if response.status_code == 200:
-                return True
-            else:
-                logger.error(f"Failed to send message: {response.text}")
-                return False
+            return response.status_code == 200
         except Exception as e:
             logger.error(f"Error sending message: {e}")
             return False
@@ -240,12 +266,7 @@ class TelegramBotHandler:
                 'message_id': message_id
             }
             response = requests.post(f"{self.bot_url}/deleteMessage", json=data)
-            if response.status_code == 200:
-                logger.info(f"Successfully deleted message {message_id} from chat {chat_id}")
-                return True
-            else:
-                logger.warning(f"Could not delete message {message_id}: {response.text}")
-                return False
+            return response.status_code == 200
         except Exception as e:
             logger.error(f"Error deleting message: {e}")
             return False
@@ -261,29 +282,12 @@ class TelegramBotHandler:
             logger.error(f"Error getting chat info: {e}")
             return None
     
-    def get_chat_member(self, chat_id, user_id):
-        """Get chat member information"""
-        try:
-            response = requests.get(f"{self.bot_url}/getChatMember", params={'chat_id': chat_id, 'user_id': user_id})
-            if response.status_code == 200:
-                return response.json()['result']
-            return None
-        except Exception as e:
-            logger.error(f"Error getting chat member: {e}")
-            return None
-    
-    def process_updates(self, updates):
-        """Process multiple updates"""
-        for update in updates:
-            self.process_update(update)
-    
     def process_update(self, update):
-        """Process incoming update - SIMPLIFIED VERSION"""
+        """Process incoming update"""
         try:
-            update_id = update.get('update_id')
-            logger.info(f"Processing update {update_id}")
+            logger.info(f"Received update: {update.get('update_id')}")
             
-            # Handle ALL message types - this is the key fix
+            # Handle different update types
             if 'message' in update:
                 self.handle_message(update['message'])
             elif 'channel_post' in update:
@@ -301,7 +305,6 @@ class TelegramBotHandler:
         try:
             chat_id = message['chat']['id']
             chat_type = message['chat']['type']
-            message_id = message['message_id']
             
             logger.info(f"Channel post detected in {chat_type} {chat_id}")
             
@@ -310,7 +313,7 @@ class TelegramBotHandler:
                 logger.info(f"Auto-setting up channel from channel post: {chat_id}")
                 self.auto_setup_channel(chat_id)
             
-            # Now process the message for deletion
+            # Process the message for deletion
             self.process_message_for_deletion(message)
                 
         except Exception as e:
@@ -325,20 +328,19 @@ class TelegramBotHandler:
             
             chat_id = str(chat['id'])
             chat_title = chat.get('title', 'Unknown Chat')
-            chat_type = chat['type']
             
             logger.info(f"Chat member update: {chat_title} ({chat_id}): {old_status} -> {new_status}")
             
             # Bot was added to a group/channel
             if new_status in ['administrator', 'member'] and old_status == 'left':
-                logger.info(f"Bot was added to {chat_type} {chat_title}")
+                logger.info(f"Bot was added to {chat_title}")
                 self.auto_setup_channel(chat_id, chat_title)
             
         except Exception as e:
             logger.error(f"Error handling chat member update: {e}")
     
     def handle_message(self, message):
-        """Handle incoming message - SIMPLIFIED"""
+        """Handle incoming message"""
         try:
             chat_id = message['chat']['id']
             chat_type = message['chat']['type']
@@ -405,7 +407,7 @@ I will automatically delete all messages except those from specified admins.
             if success:
                 logger.info(f"✅ Successfully sent welcome message to {chat_title}")
             else:
-                logger.warning(f"⚠️ Could not send welcome message to {chat_title} - bot may not have send message permission")
+                logger.warning(f"⚠️ Could not send welcome message to {chat_title}")
             
             return True
             
@@ -479,6 +481,19 @@ I will automatically delete all messages except those from specified admins.
             
         except Exception as e:
             logger.error(f"Error processing message for deletion: {e}")
+    
+    def set_user_state(self, user_id, state, data=None):
+        """Set user conversation state"""
+        self.user_states[user_id] = {'state': state, 'data': data or {}}
+    
+    def get_user_state(self, user_id):
+        """Get user conversation state"""
+        return self.user_states.get(user_id)
+    
+    def clear_user_state(self, user_id):
+        """Clear user conversation state"""
+        if user_id in self.user_states:
+            del self.user_states[user_id]
     
     def handle_user_state(self, user_id, chat_id, text):
         """Handle user in conversation state"""
@@ -592,13 +607,6 @@ Choose an option below to manage your channel protection:
     
     def send_setup_message(self, chat_id, user_id):
         """Send setup message"""
-        # Check if user is admin in the chat (for groups)
-        if message['chat']['type'] != 'channel':
-            user_member = self.get_chat_member(chat_id, user_id)
-            if not user_member or user_member['status'] not in ['administrator', 'creator']:
-                self.send_message(chat_id, "❌ You need to be an administrator in this chat to setup the bot.")
-                return
-        
         # Check if already setup
         if self.db.is_channel_setup(str(chat_id)):
             self.send_message(chat_id, "✅ Bot is already setup in this chat! Use /admins to manage allowed users.")
@@ -654,9 +662,132 @@ You can now manage settings and add allowed admins using the menus.
         except Exception as e:
             logger.error(f"Error in setup: {e}")
             self.send_message(chat_id, "❌ Error during setup")
+    
+    # Add the remaining methods (send_admin_management, prompt_add_admin, etc.)
+    # These would be the same as in previous versions
+    
+    def send_admin_management(self, chat_id, user_id):
+        """Send admin management menu"""
+        if not self.db.is_channel_setup(str(chat_id)):
+            self.send_message(chat_id, "❌ Bot is not setup in this chat. Please run /setup first.")
+            return
+        
+        text = """
+👥 <b>Admin Management</b>
 
-    # ... (include all the other methods like send_admin_management, prompt_add_admin, etc.)
-    # These remain the same as previous versions
+Manage users who are allowed to post messages without deletion.
+
+Choose an option below:
+        """
+        keyboard = {
+            'inline_keyboard': [
+                [{'text': '➕ Add Admin', 'callback_data': 'add_admin'}],
+                [{'text': '➖ Remove Admin', 'callback_data': 'remove_admin'}],
+                [{'text': '📋 List Admins', 'callback_data': 'list_admins'}],
+                [{'text': '🔙 Back to Main', 'callback_data': 'main_menu'}]
+            ]
+        }
+        self.send_message(chat_id, text, keyboard)
+    
+    def prompt_add_admin(self, chat_id, user_id):
+        """Prompt user to add admin"""
+        text = """
+➕ <b>Add Admin</b>
+
+Reply with the username (format: @username or username):
+        """
+        self.set_user_state(user_id, 'waiting_admin_username')
+        keyboard = {
+            'inline_keyboard': [
+                [{'text': '🔙 Back', 'callback_data': 'manage_admins'}]
+            ]
+        }
+        self.send_message(chat_id, text, keyboard)
+    
+    def process_add_admin(self, chat_id, user_id, username_input):
+        """Process adding an admin"""
+        username = username_input.lstrip('@')
+        # Simple implementation - you would add logic to find user by username
+        self.db.add_admin(str(chat_id), user_id, username, "User", user_id)
+        self.send_message(chat_id, f"✅ Added @{username} as admin")
+        self.clear_user_state(user_id)
+    
+    def send_settings(self, chat_id, user_id):
+        """Send settings menu"""
+        if not self.db.is_channel_setup(str(chat_id)):
+            self.send_message(chat_id, "❌ Bot is not setup in this chat. Please run /setup first.")
+            return
+        
+        channel_settings = self.db.get_channel_settings(str(chat_id))
+        interval = channel_settings['delete_interval'] if channel_settings else 300
+        interval_minutes = interval // 60
+        
+        text = f"""
+⚙️ <b>Bot Settings</b>
+
+<b>Deletion Interval:</b> {interval} seconds ({interval_minutes} minutes)
+
+Choose an option below:
+        """
+        keyboard = {
+            'inline_keyboard': [
+                [{'text': f'⏰ Change Interval ({interval_minutes}min)', 'callback_data': 'set_interval'}],
+                [{'text': '🔙 Back to Main', 'callback_data': 'main_menu'}]
+            ]
+        }
+        self.send_message(chat_id, text, keyboard)
+    
+    def prompt_set_interval(self, chat_id, user_id):
+        """Prompt user to set deletion interval"""
+        text = """
+⏰ <b>Deletion Interval</b>
+
+Select how long to wait before deleting messages:
+        """
+        keyboard = {
+            'inline_keyboard': [
+                [{'text': '1 minute', 'callback_data': 'interval_60'}],
+                [{'text': '5 minutes', 'callback_data': 'interval_300'}],
+                [{'text': '10 minutes', 'callback_data': 'interval_600'}],
+                [{'text': '15 minutes', 'callback_data': 'interval_900'}],
+                [{'text': '30 minutes', 'callback_data': 'interval_1800'}],
+                [{'text': '🔙 Back to Settings', 'callback_data': 'settings'}]
+            ]
+        }
+        self.send_message(chat_id, text, keyboard)
+    
+    def set_delete_interval(self, chat_id, user_id, interval):
+        """Set deletion interval"""
+        self.db.update_delete_interval(str(chat_id), interval)
+        minutes = interval // 60
+        self.send_message(chat_id, f"✅ Deletion interval set to {minutes} minutes")
+    
+    def show_admin_list(self, chat_id):
+        """Show list of allowed admins"""
+        admins = self.db.get_admins(str(chat_id))
+        if not admins:
+            text = "❌ No allowed admins found."
+        else:
+            text = "✅ <b>Allowed Admins:</b>\n\n"
+            for i, (user_id, username, full_name, added_date) in enumerate(admins, 1):
+                text += f"{i}. <b>{full_name}</b> (@{username})\n"
+        
+        keyboard = {
+            'inline_keyboard': [
+                [{'text': '🔙 Back to Admin Management', 'callback_data': 'manage_admins'}]
+            ]
+        }
+        self.send_message(chat_id, text, keyboard)
+    
+    def send_stats_message(self, chat_id):
+        """Send statistics message"""
+        text = """
+📊 <b>Bot Statistics</b>
+
+<b>Status:</b> 🟢 Running
+<b>Service:</b> Auto Delete Bot
+        """
+        self.send_message(chat_id, text)
 
 # ==================== DELETION WORKER ====================
 
@@ -698,61 +829,24 @@ class DeletionWorker:
         except Exception as e:
             logger.error(f"Error in process_pending_deletions: {e}")
 
-# ==================== BOT POLLING MANAGER ====================
-
-class BotPollingManager:
-    def __init__(self, bot_handler):
-        self.bot = bot_handler
-        self.is_running = False
-        self.last_update_id = 0
-    
-    def start_polling(self):
-        """Start polling"""
-        self.is_running = True
-        
-        def polling_loop():
-            while self.is_running:
-                try:
-                    response = requests.get(
-                        f"{self.bot.bot_url}/getUpdates",
-                        params={
-                            'offset': self.last_update_id + 1,
-                            'timeout': 30,
-                            'allowed_updates': ['message', 'callback_query', 'my_chat_member', 'channel_post']
-                        },
-                        timeout=35
-                    )
-                    
-                    if response.status_code == 200:
-                        data = response.json()
-                        if data['ok']:
-                            updates = data['result']
-                            if updates:
-                                logger.info(f"📨 Received {len(updates)} updates")
-                                self.bot.process_updates(updates)
-                                self.last_update_id = max(update['update_id'] for update in updates)
-                except Exception as e:
-                    logger.error(f"Error in polling: {e}")
-                    time.sleep(10)
-        
-        thread = threading.Thread(target=polling_loop, daemon=True)
-        thread.start()
-        logger.info("Bot polling started")
-    
-    def stop_polling(self):
-        self.is_running = False
-
 # ==================== MAIN APPLICATION ====================
 
 class AutoDeleteBot:
     def __init__(self, token: str):
         self.token = token
         self.db = DatabaseManager()
-        self.bot = TelegramBotHandler(token, self.db)
+        self.bot = TelegramBot(token, self.db)
         self.worker = DeletionWorker(self.bot, self.db)
-        self.polling_manager = BotPollingManager(self.bot)
         
         logger.info("Auto Delete Bot initialized successfully")
+    
+    def setup_webhook(self):
+        """Setup webhook"""
+        return self.bot.setup_webhook()
+    
+    def process_update(self, update):
+        """Process incoming update"""
+        self.bot.process_update(update)
     
     def start_keep_alive(self):
         """Start keep-alive service"""
@@ -767,6 +861,7 @@ class AutoDeleteBot:
                 while True:
                     try:
                         requests.get(health_url, timeout=10)
+                        logger.info("Keep-alive ping successful")
                     except:
                         pass
                     time.sleep(300)
@@ -789,10 +884,10 @@ class AutoDeleteBot:
         # Start deletion worker
         self.worker.start()
         
-        # Start bot polling
-        self.polling_manager.start_polling()
+        # Setup webhook
+        self.setup_webhook()
         
-        logger.info("🤖 Auto Delete Bot is now running!")
+        logger.info("🤖 Auto Delete Bot is now running with webhook!")
         
         # Keep main thread alive
         try:
@@ -800,7 +895,6 @@ class AutoDeleteBot:
                 time.sleep(60)
         except KeyboardInterrupt:
             logger.info("Bot stopped by user")
-            self.polling_manager.stop_polling()
 
 # ==================== MAIN EXECUTION ====================
 
@@ -812,8 +906,9 @@ if __name__ == "__main__":
         exit(1)
     
     try:
-        bot = AutoDeleteBot(BOT_TOKEN)
-        bot.run()
+        # Set global instance
+        bot_instance = AutoDeleteBot(BOT_TOKEN)
+        bot_instance.run()
     except Exception as e:
         logger.error(f"❌ Failed to start bot: {e}")
         exit(1)
