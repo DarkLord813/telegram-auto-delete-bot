@@ -309,18 +309,29 @@ class TelegramBot:
             return []
     
     def process_update(self, update):
-        """Process incoming update"""
+        """Process incoming update - IMPROVED CHANNEL DETECTION"""
         try:
             update_id = update.get('update_id')
-            logger.info(f"Received update: {update_id}")
+            logger.info(f"📨 Received update: {update_id}")
             
-            # Handle different update types
+            # DEBUG: Log the entire update to see what we're receiving
+            logger.info(f"Update content: {update}")
+            
+            # Handle bot being added to channels/groups - PRIMARY CHANNEL DETECTION
+            if 'my_chat_member' in update:
+                logger.info("🎯 Found my_chat_member update - processing bot addition/removal")
+                self.handle_chat_member_update(update['my_chat_member'])
+                return
+            
+            # Handle channel posts - SECONDARY CHANNEL DETECTION
+            if 'channel_post' in update:
+                logger.info("📢 Found channel_post update - bot is in a channel!")
+                self.handle_channel_post(update['channel_post'])
+                return
+            
+            # Handle regular messages in groups/channels
             if 'message' in update:
                 self.handle_message(update['message'])
-            elif 'channel_post' in update:
-                self.handle_channel_post(update['channel_post'])
-            elif 'my_chat_member' in update:
-                self.handle_chat_member_update(update['my_chat_member'])
             elif 'callback_query' in update:
                 self.handle_callback_query(update['callback_query'])
                 
@@ -328,66 +339,77 @@ class TelegramBot:
             logger.error(f"Error processing update: {e}")
     
     def handle_channel_post(self, message):
-        """Handle channel posts - this means we're in a channel!"""
+        """Handle channel posts - this means we're definitely in a channel!"""
         try:
             chat_id = message['chat']['id']
             chat_type = message['chat']['type']
             message_id = message['message_id']
+            chat_title = message['chat'].get('title', 'Unknown Channel')
             
-            logger.info(f"Channel post detected in {chat_type} {chat_id}")
+            logger.info(f"📢 Channel post detected in {chat_type} '{chat_title}' ({chat_id})")
             
             # Auto-setup the channel if not already setup
             if not self.db.is_channel_setup(str(chat_id)):
-                logger.info(f"Auto-setting up channel from channel post: {chat_id}")
-                self.auto_setup_channel(chat_id)
+                logger.info(f"🚀 Auto-setting up channel from channel post: {chat_title}")
+                self.auto_setup_channel(chat_id, chat_title)
+            else:
+                logger.info(f"ℹ️ Channel {chat_title} is already setup")
             
-            # Process the message for deletion
+            # Process the message for deletion (delete all messages in channels except from allowed admins)
             self.process_message_for_deletion(message)
                 
         except Exception as e:
             logger.error(f"Error handling channel post: {e}")
     
     def handle_chat_member_update(self, chat_member_update):
-        """Handle when bot is added/removed from chats"""
+        """Handle when bot is added/removed from chats - IMPROVED DETECTION"""
         try:
             chat = chat_member_update['chat']
-            new_status = chat_member_update['new_chat_member']['status']
-            old_status = chat_member_update['old_chat_member']['status']
+            new_member = chat_member_update['new_chat_member']
+            old_member = chat_member_update['old_chat_member']
+            
+            new_status = new_member['status']
+            old_status = old_member['status']
             
             chat_id = str(chat['id'])
             chat_title = chat.get('title', 'Unknown Chat')
+            chat_type = chat['type']
             
-            logger.info(f"Chat member update: {chat_title} ({chat_id}): {old_status} -> {new_status}")
+            logger.info(f"👤 Chat member update in {chat_type} '{chat_title}': {old_status} -> {new_status}")
             
             # Bot was added to a group/channel
-            if new_status in ['administrator', 'member'] and old_status == 'left':
-                logger.info(f"Bot was added to {chat_title}")
+            if new_status in ['administrator', 'member', 'restricted'] and old_status == 'left':
+                logger.info(f"🎉 Bot was added to {chat_type} '{chat_title}'")
                 self.auto_setup_channel(chat_id, chat_title)
             
+            # Bot was removed from a group/channel
+            elif new_status == 'left' and old_status in ['administrator', 'member', 'restricted']:
+                logger.info(f"🔴 Bot was removed from {chat_title}")
+                
         except Exception as e:
             logger.error(f"Error handling chat member update: {e}")
     
     def handle_message(self, message):
-        """Handle incoming message"""
+        """Handle incoming message - IMPROVED CHANNEL DETECTION"""
         try:
             chat_id = message['chat']['id']
             chat_type = message['chat']['type']
+            chat_title = message['chat'].get('title', 'Unknown Chat')
             
-            logger.info(f"Message in {chat_type} {chat_id}")
+            logger.info(f"💬 Message in {chat_type} '{chat_title}' ({chat_id})")
             
-            # If this is a service message about bot being added
+            # If this is a service message about bot being added to a group
             if 'new_chat_members' in message:
                 for new_member in message['new_chat_members']:
                     if new_member.get('id') == self.bot_info['id']:
-                        logger.info(f"Bot was added via new_chat_members message to {chat_id}")
-                        chat_title = message['chat'].get('title', 'Unknown Chat')
+                        logger.info(f"🎉 Bot was added via new_chat_members message to {chat_title}")
                         self.auto_setup_channel(chat_id, chat_title)
                         return
             
             # For channels, if we get any message and we're not setup, auto-setup
             if chat_type == 'channel' and not self.db.is_channel_setup(str(chat_id)):
-                logger.info(f"Auto-setting up channel from first message: {chat_id}")
-                self.auto_setup_channel(chat_id)
+                logger.info(f"🚀 Auto-setting up channel from first message: {chat_title}")
+                self.auto_setup_channel(chat_id, chat_title)
             
             # Process the message for commands or deletion
             self.process_message_for_deletion(message)
@@ -407,7 +429,7 @@ class TelegramBot:
             
             # Check if already setup
             if self.db.is_channel_setup(str(chat_id)):
-                logger.info(f"Channel {chat_title} is already setup")
+                logger.info(f"ℹ️ Channel {chat_title} is already setup")
                 return True
             
             logger.info(f"🚀 AUTO-SETUP: Setting up channel: {chat_title} ({chat_id})")
@@ -417,14 +439,16 @@ class TelegramBot:
             
             # Try to send welcome message
             welcome_text = f"""
-🤖 <b>Auto Delete Bot detected in {chat_title}!</b>
+🤖 <b>Auto Delete Bot has been added to {chat_title}!</b>
 
-I will automatically delete all messages except those from specified admins.
+I will automatically delete ALL messages except those from specified admins.
 
 <b>Next steps:</b>
 1. Add allowed admins using /admins command
 2. Configure deletion timing using /settings command
 3. Make sure I have <b>delete messages</b> permission!
+
+<b>Important:</b> I will delete ALL messages from users who are NOT in the allowed admin list.
 
 <b>Commands:</b>
 /admins - Manage allowed users
@@ -435,7 +459,7 @@ I will automatically delete all messages except those from specified admins.
             if success:
                 logger.info(f"✅ Successfully sent welcome message to {chat_title}")
             else:
-                logger.warning(f"⚠️ Could not send welcome message to {chat_title}")
+                logger.warning(f"⚠️ Could not send welcome message to {chat_title} - bot may not have send_message permission")
             
             return True
             
@@ -444,14 +468,15 @@ I will automatically delete all messages except those from specified admins.
             return False
     
     def process_message_for_deletion(self, message):
-        """Process message for commands or deletion - FIXED VERSION"""
+        """Process message for commands or deletion - FIXED ADMIN RECOGNITION"""
         try:
             chat_id = message['chat']['id']
             user_id = message['from']['id'] if 'from' in message else None
             message_id = message['message_id']
             chat_type = message['chat']['type']
+            chat_title = message['chat'].get('title', 'Unknown')
             
-            logger.info(f"Processing message {message_id} in {chat_type} {chat_id} from user {user_id}")
+            logger.info(f"🔍 Processing message {message_id} in {chat_type} '{chat_title}' from user {user_id}")
             
             # Check if it's a command
             if 'text' in message and message['text'].startswith('/'):
@@ -471,53 +496,64 @@ I will automatically delete all messages except those from specified admins.
             
             # Check if channel is setup
             if not self.db.is_channel_setup(str(chat_id)):
-                logger.info(f"Channel {chat_id} not setup yet, ignoring message")
+                logger.info(f"ℹ️ Channel {chat_id} not setup yet, ignoring message")
                 return
             
-            # For channels, there's no 'from' field for posts, so we need to handle differently
+            # For channels, handle message deletion
             if chat_type == 'channel':
                 # In channels, check if message is from the bot itself
                 if 'from' in message and message['from'].get('id') == self.bot_info['id']:
-                    logger.info("Message from bot itself - not deleting")
+                    logger.info("🤖 Message from bot itself - not deleting")
                     return  # Don't delete bot's own messages
                 
-                # For channels, delete ALL messages (no admin exceptions in channels)
-                logger.info(f"Channel message detected - scheduling deletion")
+                # For channels, check if user is in the allowed admin list
+                if user_id:
+                    is_allowed_admin = self.db.is_admin(str(chat_id), user_id)
+                    logger.info(f"👤 User {user_id} allowed admin status: {'YES' if is_allowed_admin else 'NO'}")
+                    
+                    if is_allowed_admin:
+                        logger.info(f"✅ Allowed admin {user_id} - not deleting their message")
+                        return  # Allowed admin can post freely
+                
+                # If we get here, the user is NOT an allowed admin - schedule deletion
+                logger.info(f"🚫 User {user_id} is NOT an allowed admin - scheduling deletion")
                 channel_settings = self.db.get_channel_settings(str(chat_id))
                 if channel_settings:
                     delete_interval = channel_settings['delete_interval']
                     self.db.schedule_deletion(str(chat_id), message_id, delete_interval)
-                    logger.info(f"✅ Scheduled deletion for channel message {message_id} after {delete_interval}s")
+                    logger.info(f"⏰ Scheduled deletion for message {message_id} after {delete_interval}s")
                 return
             
-            # For groups, check if user is admin
+            # For groups, check if user is in the allowed admin list
             if user_id:
-                is_admin = self.db.is_admin(str(chat_id), user_id)
-                logger.info(f"User {user_id} admin status: {is_admin}")
+                is_allowed_admin = self.db.is_admin(str(chat_id), user_id)
+                logger.info(f"👤 User {user_id} allowed admin status: {'YES' if is_allowed_admin else 'NO'}")
                 
-                if is_admin:
-                    logger.info(f"Message from admin {user_id} - not deleting")
-                    return  # Admin can post freely
+                if is_allowed_admin:
+                    logger.info(f"✅ Allowed admin {user_id} - not deleting their message")
+                    return  # Allowed admin can post freely
+            
+            # If we get here, the user is NOT an allowed admin - schedule deletion
             
             # Get channel settings
             channel_settings = self.db.get_channel_settings(str(chat_id))
             if not channel_settings:
-                logger.warning(f"No channel settings found for {chat_id}")
+                logger.warning(f"❌ No channel settings found for {chat_id}")
                 return
             
             # Check message time (only delete messages after bot was added)
             message_date = datetime.fromtimestamp(message['date'])
             if message_date < channel_settings['bot_added_date']:
-                logger.info(f"Message from before bot was added - not deleting")
+                logger.info(f"📅 Message from before bot was added - not deleting")
                 return  # Message before bot was added
             
-            # Schedule deletion
+            # Schedule deletion for non-admin user
             delete_interval = channel_settings['delete_interval']
             self.db.schedule_deletion(str(chat_id), message_id, delete_interval)
-            logger.info(f"✅ Scheduled deletion for message {message_id} in {chat_id} after {delete_interval}s")
+            logger.info(f"⏰ Scheduled deletion for message {message_id} from non-admin user {user_id} after {delete_interval}s")
             
         except Exception as e:
-            logger.error(f"Error processing message for deletion: {e}")
+            logger.error(f"❌ Error processing message for deletion: {e}")
     
     def set_user_state(self, user_id, state, data=None):
         """Set user conversation state"""
@@ -551,7 +587,7 @@ I will automatically delete all messages except those from specified admins.
         user_id = message['from']['id'] if 'from' in message else None
         text = message['text']
         
-        logger.info(f"Command received: {text} from {user_id} in {chat_id}")
+        logger.info(f"⌨️ Command received: {text} from {user_id} in {chat_id}")
         
         if text == '/start':
             self.send_main_menu(chat_id)
@@ -598,7 +634,7 @@ I will automatically delete all messages except those from specified admins.
         user_id = callback_query['from']['id']
         data = callback_query['data']
         
-        logger.info(f"Callback query: {data} from {user_id}")
+        logger.info(f"🔘 Callback query: {data} from {user_id}")
         
         # Answer callback query
         requests.post(f"{self.bot_url}/answerCallbackQuery", json={'callback_query_id': callback_query['id']})
@@ -634,7 +670,9 @@ I will automatically delete all messages except those from specified admins.
         text = """
 🤖 <b>Auto Delete Bot - Main Menu</b>
 
-Choose an option below to manage your channel protection:
+I automatically delete ALL messages except those from specified admins.
+
+Choose an option below:
         """
         keyboard = {
             'inline_keyboard': [
@@ -659,10 +697,12 @@ Choose an option below to manage your channel protection:
 
 Click Confirm Setup to configure the bot in this chat.
 
+<b>Important:</b> I will delete ALL messages from users who are NOT in the allowed admin list.
+
 <b>Requirements:</b>
 • I need <b>delete messages</b> permission
 • Only messages after setup will be deleted
-• You can add allowed admins after setup
+• You must add allowed admins after setup
         """
         keyboard = {
             'inline_keyboard': [
@@ -682,12 +722,13 @@ Click Confirm Setup to configure the bot in this chat.
                 return
             
             chat_title = chat_info.get('title', 'Unknown Chat')
+            chat_type = chat_info.get('type', 'unknown')
             
             # Setup channel in database
             self.db.add_channel(str(chat_id), chat_title)
             
-            # Add user as admin if it's a group (channels don't have user context)
-            if user_id:
+            # Add user as admin if it's a group (in channels, we'll add admins manually)
+            if user_id and chat_type != 'channel':
                 self.db.add_admin(str(chat_id), user_id, "user", "User", user_id)
             
             success_text = f"""
@@ -697,7 +738,9 @@ Click Confirm Setup to configure the bot in this chat.
 <b>Auto-deletion:</b> 🟢 Enabled
 <b>Deletion Interval:</b> 5 minutes
 
-You can now manage settings and add allowed admins using the menus.
+<b>Important:</b> I will delete ALL messages from users who are NOT in the allowed admin list.
+
+Use /admins to add allowed users who can post without deletion.
             """
             self.send_message(chat_id, success_text)
             
@@ -719,6 +762,8 @@ You can now manage settings and add allowed admins using the menus.
 
 Currently have <b>{admin_count}</b> allowed admin(s).
 
+<b>Only users in this list can post without deletion.</b>
+
 Choose an option below:
         """
         keyboard = {
@@ -739,6 +784,8 @@ Choose an option below:
 Reply with the username (format: @username or username):
 
 The user must be an admin in this chat.
+
+<b>Only users in the allowed admin list can post without deletion.</b>
         """
         self.set_user_state(user_id, 'waiting_admin_username')
         keyboard = {
@@ -795,6 +842,8 @@ This user can now post messages without them being deleted.
 ➖ <b>Remove Admin</b>
 
 Reply with the username to remove (format: @username or username):
+
+This user's messages will be deleted after removal.
         """
         self.set_user_state(user_id, 'waiting_remove_admin')
         keyboard = {
@@ -851,9 +900,16 @@ This user's messages will now be auto-deleted.
         admins = self.db.get_admins(str(chat_id))
         
         if not admins:
-            text = "❌ No allowed admins found.\n\nUse the 'Add Admin' button to add users."
+            text = """
+❌ No allowed admins found.
+
+<b>All messages will be deleted!</b>
+
+Use the 'Add Admin' button to add users who can post without deletion.
+            """
         else:
             text = "✅ <b>Allowed Admins:</b>\n\n"
+            text += "<b>Only these users can post without deletion:</b>\n\n"
             for i, (user_id, username, full_name, added_date) in enumerate(admins, 1):
                 date_str = datetime.fromisoformat(added_date).strftime('%Y-%m-%d')
                 text += f"{i}. <b>{full_name}</b> (@{username})\n   ID: <code>{user_id}</code>\n   Added: {date_str}\n\n"
@@ -880,7 +936,7 @@ This user's messages will now be auto-deleted.
 
 <b>Deletion Interval:</b> {interval} seconds ({interval_minutes} minutes)
 
-Messages from non-approved users will be deleted after this delay.
+Messages from users NOT in the allowed admin list will be deleted after this delay.
 
 Choose an option below to manage settings:
         """
@@ -897,7 +953,7 @@ Choose an option below to manage settings:
         text = """
 ⏰ <b>Deletion Interval</b>
 
-Select how long to wait before deleting messages from non-approved users:
+Select how long to wait before deleting messages from users NOT in the allowed admin list:
 
 • <b>1 minute</b> - Quick deletion
 • <b>5 minutes</b> - Recommended (default)
@@ -929,7 +985,7 @@ Choose an option below:
 
 <b>New Interval:</b> {interval} seconds ({minutes} minutes)
 
-Messages from non-approved users will be deleted after this delay.
+Messages from users NOT in the allowed admin list will be deleted after this delay.
         """
         self.send_message(chat_id, success_text)
     
@@ -976,7 +1032,7 @@ class DeletionWorker:
         logger.info("Deletion worker started")
     
     def process_pending_deletions(self):
-        """Process pending message deletions - FIXED VERSION"""
+        """Process pending message deletions"""
         try:
             pending = self.db.get_pending_deletions()
             if pending:
