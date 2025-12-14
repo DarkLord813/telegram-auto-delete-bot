@@ -29,11 +29,30 @@ if not BOT_TOKEN:
 
 PORT = int(os.environ.get('PORT', 8080))
 REDEPLOY_TOKEN = os.environ.get('REDEPLOY_TOKEN', 'default_redeploy_token')
-BOT_OWNER_ID = os.environ.get('BOT_OWNER_ID', '7475473197')  # Default owner ID
 
-print(f"✅ Bot token loaded: {BOT_TOKEN[:10]}...")
+# Parse multiple admin IDs from environment variable
+admin_ids_raw = os.environ.get('BOT_OWNER_IDS', '7713987088 7475473197')
+print(f"🔍 Raw admin IDs from env: {admin_ids_raw}")
+
+# Parse admin IDs - handle space or newline separated
+admin_ids = []
+try:
+    # Split by any whitespace (space, newline, tab) and filter empty strings
+    for admin_id_str in admin_ids_raw.split():
+        if admin_id_str.strip():  # Check if not empty after stripping
+            admin_id = int(admin_id_str.strip())
+            admin_ids.append(admin_id)
+            print(f"✅ Parsed admin ID: {admin_id}")
+    
+    if not admin_ids:
+        print("⚠️ No admin IDs found, using defaults")
+        admin_ids = [7475473197, 7713987088]
+except Exception as e:
+    print(f"⚠️ Error parsing admin IDs: {e}, using defaults")
+    admin_ids = [7475473197, 7713987088]
+
+print(f"✅ Admin IDs loaded: {admin_ids}")
 print(f"✅ Using PORT: {PORT}")
-print(f"✅ Bot Owner ID: {BOT_OWNER_ID}")
 print(f"✅ Redeploy token: {'Set' if REDEPLOY_TOKEN != 'default_redeploy_token' else 'Using default'}")
 
 # Health check server
@@ -207,17 +226,16 @@ def start_flask_server():
 # ==================== TELEGRAM BOT CLASS ====================
 
 class TelegramProtectionBot:
-    def __init__(self, token, owner_id):
+    def __init__(self, token, owner_ids):
         self.token = token
         self.base_url = f"https://api.telegram.org/bot{token}/"
-        self.owner_id = int(owner_id) if owner_id else None
+        self.owner_ids = owner_ids if isinstance(owner_ids, list) else [owner_ids]
         self.conn = None
         self.bot_username = None
         self.channel_cache = {}
         
         print(f"🤖 Bot initialized with token: {token[:10]}...")
-        if self.owner_id:
-            print(f"👑 Bot Owner ID: {self.owner_id}")
+        print(f"👑 Bot Owner IDs: {self.owner_ids}")
         self.setup_database()
     
     def setup_database(self):
@@ -239,6 +257,23 @@ class TelegramProtectionBot:
                     is_active INTEGER DEFAULT 1
                 )
             ''')
+            
+            # Bot owners table (stores the owner IDs)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS bot_owners (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER UNIQUE,
+                    added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Initialize bot owners if table is empty
+            cursor.execute('SELECT COUNT(*) FROM bot_owners')
+            if cursor.fetchone()[0] == 0:
+                for owner_id in self.owner_ids:
+                    cursor.execute('INSERT OR IGNORE INTO bot_owners (user_id) VALUES (?)', (owner_id,))
+                self.conn.commit()
+                print(f"✅ Initialized {len(self.owner_ids)} bot owners in database")
             
             # Non-admin posts table (posts to be deleted)
             cursor.execute('''
@@ -530,7 +565,7 @@ I protect your channels by:
 1. Add me as admin to your channel
 2. Use /addadmin to add trusted users
 3. Posts from others will be auto-deleted
-4. I'll notify you about comments
+4. I'll notify all bot owners about comments
 
 Need help? Use /help for detailed instructions."""
         
@@ -723,9 +758,14 @@ Need help? Use /help for detailed instructions."""
         chat_id = message['chat']['id']
         stats = self.get_system_stats()
         
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM bot_owners')
+        owner_count = cursor.fetchone()[0]
+        
         stats_text = f"""📊 <b>Bot Statistics</b>
 
 🤖 Bot: @{self.bot_username or 'N/A'}
+👥 Bot Owners: {owner_count}
 👑 Protected Admins: {stats.get('active_admins', 0)}
 🗑️ Total Posts Deleted: {stats.get('total_posts_deleted', 0)}
 💬 Comments Detected: {stats.get('total_comments_detected', 0)}
@@ -764,11 +804,11 @@ I automatically delete posts from non-admins and notify about comments.
 ⚠️ <b>How It Works:</b>
 • Protected admins' posts: NOT deleted
 • Non-admin posts: Auto-deleted after specified time
-• Comments/replies: Owner gets notified with link
+• Comments/replies: All bot owners get notified with link
 • All deletions are logged
 
 📞 <b>Support:</b>
-Contact the bot owner for help."""
+Contact the bot owners for help."""
         
         self.send_message(chat_id, help_text)
     
@@ -869,8 +909,8 @@ Contact the bot owner for help."""
             cursor.execute('''
                 INSERT INTO comment_notifications 
                 (channel_id, original_message_id, comment_message_id, 
-                 commenter_id, commenter_name, comment_text)
-                VALUES (?, ?, ?, ?, ?, ?)
+                 commenter_id, commenter_name, comment_text, notified_at)
+                VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
             ''', (chat_id, original_message_id, message['message_id'], 
                   commenter_id, commenter_name, comment_text))
             
@@ -882,9 +922,11 @@ Contact the bot owner for help."""
             # Generate message link
             message_link = self.generate_message_link(chat_id, original_message_id)
             
-            # Notify bot owner
-            if self.owner_id:
-                notification_text = f"""💬 <b>New Comment Detected!</b>
+            # Notify ALL bot owners
+            notification_sent = False
+            for owner_id in self.owner_ids:
+                try:
+                    notification_text = f"""💬 <b>New Comment Detected!</b>
 
 📢 Channel: {channel_name}
 {'👤 Username: @' + channel_username if channel_username else '🆔 ID: ' + str(chat_id)}
@@ -897,8 +939,16 @@ Contact the bot owner for help."""
 🔗 Message Link: {message_link}
 
 ⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"""
-                
-                self.send_message(self.owner_id, notification_text)
+                    
+                    result = self.send_message(owner_id, notification_text)
+                    if result and result.get('ok'):
+                        notification_sent = True
+                        print(f"✅ Comment notification sent to owner {owner_id}")
+                except Exception as e:
+                    print(f"❌ Error sending notification to owner {owner_id}: {e}")
+            
+            if notification_sent:
+                print(f"✅ Comment notifications sent to {len(self.owner_ids)} owners")
             
         except Exception as e:
             print(f"❌ Error handling comment: {e}")
@@ -961,7 +1011,7 @@ Contact the bot owner for help."""
     
     def is_authorized_user(self, user_id):
         """Check if user is authorized to use admin commands"""
-        return user_id == self.owner_id
+        return user_id in self.owner_ids
     
     def start_auto_delete_monitor(self):
         """Start monitoring for auto-delete posts"""
@@ -1063,7 +1113,7 @@ Contact the bot owner for help."""
         print("  • /settime - Set delete time (non-admins)")
         print("  • /stats - Show statistics")
         print("  • /help - Show help")
-        print(f"\n👑 Bot Owner: {self.owner_id}")
+        print(f"\n👥 Bot Owners: {len(self.owner_ids)} users")
         
         return True
 
@@ -1085,8 +1135,8 @@ if __name__ == "__main__":
             restart_count += 1
             print(f"\n🔄 Bot start attempt #{restart_count}")
             
-            # Create and initialize bot
-            bot = TelegramProtectionBot(BOT_TOKEN, BOT_OWNER_ID)
+            # Create and initialize bot with multiple admin IDs
+            bot = TelegramProtectionBot(BOT_TOKEN, admin_ids)
             if bot.run():
                 print("✅ Bot services running successfully!")
                 
