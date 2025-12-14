@@ -55,6 +55,19 @@ print(f"✅ Admin IDs loaded: {admin_ids}")
 print(f"✅ Using PORT: {PORT}")
 print(f"✅ Redeploy token: {'Set' if REDEPLOY_TOKEN != 'default_redeploy_token' else 'Using default'}")
 
+# Delete time options (in seconds)
+DELETE_TIME_OPTIONS = {
+    '30s': 30,
+    '1m': 60,
+    '5m': 300,
+    '10m': 600,
+    '1h': 3600,
+    '2h': 7200,
+    '12h': 43200,
+    '24h': 86400,
+    'never': 0
+}
+
 # Health check server
 app = Flask(__name__)
 
@@ -176,7 +189,7 @@ def home():
             'Delete Non-Admin Posts',
             'Comment/Reply Detection',
             'Owner Notifications',
-            'Auto-Delete Scheduling',
+            'Auto-Delete Scheduling with Inline Buttons',
             '24/7 Keep-Alive'
         ]
     })
@@ -253,7 +266,7 @@ class TelegramProtectionBot:
                     first_name TEXT,
                     added_by INTEGER,
                     added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    delete_after_hours INTEGER DEFAULT 0,
+                    delete_after_seconds INTEGER DEFAULT 0,
                     is_active INTEGER DEFAULT 1
                 )
             ''')
@@ -283,7 +296,7 @@ class TelegramProtectionBot:
                     message_id INTEGER,
                     user_id INTEGER,
                     user_name TEXT,
-                    delete_after_hours INTEGER,
+                    delete_after_seconds INTEGER,
                     scheduled_delete_time DATETIME,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     deleted_at DATETIME,
@@ -293,6 +306,17 @@ class TelegramProtectionBot:
                     UNIQUE(channel_id, message_id)
                 )
             ''')
+            
+            # Global delete time setting
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS global_settings (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    global_delete_seconds INTEGER DEFAULT 86400
+                )
+            ''')
+            
+            # Initialize global settings
+            cursor.execute('INSERT OR IGNORE INTO global_settings (id) VALUES (1)')
             
             # Comments/replies tracking
             cursor.execute('''
@@ -393,6 +417,43 @@ class TelegramProtectionBot:
             print(f"❌ Error sending message: {e}")
             return None
     
+    def edit_message_text(self, chat_id, message_id, text, parse_mode='HTML', reply_markup=None):
+        """Edit message text"""
+        try:
+            data = {
+                'chat_id': chat_id,
+                'message_id': message_id,
+                'text': text,
+                'parse_mode': parse_mode
+            }
+            
+            if reply_markup:
+                data['reply_markup'] = json.dumps(reply_markup)
+            
+            response = requests.post(f"{self.base_url}editMessageText", data=data, timeout=10)
+            return response.json()
+        except Exception as e:
+            print(f"❌ Error editing message: {e}")
+            return None
+    
+    def answer_callback_query(self, callback_query_id, text=None, show_alert=False):
+        """Answer callback query"""
+        try:
+            data = {
+                'callback_query_id': callback_query_id
+            }
+            
+            if text:
+                data['text'] = text
+            if show_alert:
+                data['show_alert'] = show_alert
+            
+            response = requests.post(f"{self.base_url}answerCallbackQuery", data=data, timeout=10)
+            return response.json()
+        except Exception as e:
+            print(f"❌ Error answering callback: {e}")
+            return None
+    
     def delete_message(self, chat_id, message_id):
         """Delete a message from chat"""
         try:
@@ -481,6 +542,22 @@ class TelegramProtectionBot:
     def process_update(self, update):
         """Process incoming update from webhook"""
         try:
+            # Handle callback queries (inline buttons)
+            if 'callback_query' in update:
+                callback_query = update['callback_query']
+                callback_data = callback_query.get('data', '')
+                message = callback_query.get('message', {})
+                from_user = callback_query.get('from', {})
+                
+                print(f"🔘 Processing callback: {callback_data}")
+                
+                # Answer callback query first
+                self.answer_callback_query(callback_query['id'])
+                
+                # Process callback data
+                self.process_callback_data(callback_data, message, from_user)
+                return
+            
             # Handle messages
             if 'message' in update:
                 message = update['message']
@@ -498,20 +575,12 @@ class TelegramProtectionBot:
                         
                         if command == '/start':
                             self.handle_start(message)
-                        elif command == '/addadmin':
-                            self.handle_add_admin(message)
-                        elif command == '/removeadmin':
-                            self.handle_remove_admin(message)
-                        elif command == '/listadmins':
-                            self.handle_list_admins(message)
-                        elif command == '/settime':
-                            self.handle_set_time(message)
+                        elif command == '/menu':
+                            self.show_main_menu(message)
                         elif command == '/help':
-                            self.handle_help(message)
-                        elif command == '/stats':
-                            self.handle_stats(message)
+                            self.show_help_menu(message)
                         else:
-                            print(f"❓ Unknown command: {command}")
+                            self.show_main_menu(message)
                 
                 # Handle non-admin posts in channels/groups
                 if 'chat' in message and message['chat']['type'] in ['channel', 'group', 'supergroup']:
@@ -526,14 +595,80 @@ class TelegramProtectionBot:
             elif 'edited_message' in update:
                 print("📝 Processing edited message")
                 self.handle_edited_message(update['edited_message'])
-            
-            # Handle callback queries
-            elif 'callback_query' in update:
-                print("🔘 Processing callback query")
-                self.handle_callback_query(update['callback_query'])
                     
         except Exception as e:
             print(f"❌ Error processing update: {e}")
+            traceback.print_exc()
+    
+    def process_callback_data(self, callback_data, message, from_user):
+        """Process callback data from inline buttons"""
+        try:
+            chat_id = message['chat']['id']
+            message_id = message['message_id']
+            user_id = from_user['id']
+            
+            if not self.is_authorized_user(user_id):
+                self.edit_message_text(chat_id, message_id, 
+                    "❌ You are not authorized to use this bot.\n\n"
+                    "Only bot owners can access these controls.",
+                    reply_markup=self.get_back_button())
+                return
+            
+            if callback_data == 'main_menu':
+                self.show_main_menu_via_callback(chat_id, message_id)
+            
+            elif callback_data == 'admins_menu':
+                self.show_admins_menu(chat_id, message_id)
+            
+            elif callback_data == 'add_admin':
+                self.show_add_admin_menu(chat_id, message_id)
+            
+            elif callback_data == 'list_admins':
+                self.show_list_admins(chat_id, message_id)
+            
+            elif callback_data == 'remove_admin':
+                self.show_remove_admin_menu(chat_id, message_id)
+            
+            elif callback_data == 'time_menu':
+                self.show_time_menu(chat_id, message_id)
+            
+            elif callback_data.startswith('set_time_'):
+                time_key = callback_data.replace('set_time_', '')
+                self.set_global_delete_time(chat_id, message_id, time_key, user_id)
+            
+            elif callback_data.startswith('admin_time_'):
+                parts = callback_data.replace('admin_time_', '').split('_')
+                if len(parts) == 2:
+                    admin_id = int(parts[0])
+                    time_key = parts[1]
+                    self.set_admin_delete_time(chat_id, message_id, admin_id, time_key, user_id)
+            
+            elif callback_data.startswith('select_admin_'):
+                admin_id = int(callback_data.replace('select_admin_', ''))
+                self.show_admin_time_menu(chat_id, message_id, admin_id)
+            
+            elif callback_data.startswith('delete_admin_'):
+                admin_id = int(callback_data.replace('delete_admin_', ''))
+                self.delete_admin(chat_id, message_id, admin_id, user_id)
+            
+            elif callback_data == 'stats_menu':
+                self.show_stats(chat_id, message_id)
+            
+            elif callback_data == 'help_menu':
+                self.show_help(chat_id, message_id)
+            
+            elif callback_data == 'confirm_add_admin':
+                self.request_admin_id(chat_id, message_id)
+            
+            elif callback_data.startswith('process_admin_id_'):
+                target_user_id = int(callback_data.replace('process_admin_id_', ''))
+                self.add_admin(chat_id, message_id, target_user_id, user_id)
+            
+            elif callback_data == 'back':
+                self.show_main_menu_via_callback(chat_id, message_id)
+            
+        except Exception as e:
+            print(f"❌ Error processing callback: {e}")
             traceback.print_exc()
     
     def handle_start(self, message):
@@ -544,151 +679,186 @@ class TelegramProtectionBot:
         
         print(f"👋 Handling /start from {first_name} ({user_id})")
         
-        welcome_text = f"""👋 Hello {first_name}!
+        if not self.is_authorized_user(user_id):
+            self.send_message(chat_id, 
+                f"❌ Access Denied\n\n"
+                f"Hello {first_name}!\n"
+                f"You are not authorized to use this bot.\n"
+                f"Only bot owners can access the controls.")
+            return
+        
+        welcome_text = f"""👋 Welcome {first_name}!
 
 🤖 <b>Channel Protection Bot</b>
 
 I protect your channels by:
-1. 🚫 Auto-deleting posts from non-admins
-2. 🔔 Notifying about comments/replies
-3. ⏰ Scheduling deletions after specified time
+• 🚫 Auto-deleting posts from non-admins
+• 🔔 Notifying about comments/replies
+• ⏰ Scheduling deletions with inline buttons
 
-📋 <b>Available Commands:</b>
-/addadmin - Add a user as protected admin
-/removeadmin - Remove admin protection  
-/listadmins - List all protected admins
-/settime - Set auto-delete time for non-admins
-/stats - Show bot statistics
-/help - Show help information
+👑 <b>Bot Owners:</b> {len(self.owner_ids)} users
+🔧 <b>Status:</b> ✅ Active and ready
 
-👑 <b>How it works:</b>
-1. Add me as admin to your channel
-2. Use /addadmin to add trusted users
-3. Posts from others will be auto-deleted
-4. I'll notify all bot owners about comments
-
-Need help? Use /help for detailed instructions."""
+Use the buttons below to control the bot:"""
         
-        result = self.send_message(chat_id, welcome_text)
-        if result and result.get('ok'):
-            print(f"✅ Sent welcome message to {first_name}")
-        else:
-            print(f"❌ Failed to send welcome message: {result}")
+        keyboard = self.get_main_menu_keyboard()
+        self.send_message(chat_id, welcome_text, reply_markup=keyboard)
     
-    def handle_add_admin(self, message):
-        """Handle /addadmin command"""
+    def show_main_menu(self, message):
+        """Show main menu"""
         chat_id = message['chat']['id']
         user_id = message['from']['id']
         
-        print(f"➕ Handling /addadmin from {user_id}")
-        
-        # Check if user is authorized
         if not self.is_authorized_user(user_id):
-            self.send_message(chat_id, "❌ You are not authorized to use this command.")
-            return
-        
-        parts = message['text'].split(' ')
-        if len(parts) < 2:
             self.send_message(chat_id, 
-                "📝 <b>Usage:</b> /addadmin @username_or_id\n\n"
-                "💡 <b>Examples:</b>\n"
-                "/addadmin @username\n"
-                "/addadmin 123456789\n\n"
-                "This user's posts will NOT be auto-deleted.")
+                "❌ You are not authorized to use this bot.\n"
+                "Only bot owners can access these controls.")
             return
         
-        target = parts[1]
+        menu_text = """🤖 <b>Main Menu</b>
+
+Select an option below:"""
         
-        if target.startswith('@'):
-            username = target[1:]
-            self.send_message(chat_id, 
-                f"⚠️ Can't add @{username} by username alone.\n"
-                "Please provide their user ID: /addadmin 123456789")
-            return
-        else:
-            try:
-                target_user_id = int(target)
+        keyboard = self.get_main_menu_keyboard()
+        self.send_message(chat_id, menu_text, reply_markup=keyboard)
+    
+    def show_main_menu_via_callback(self, chat_id, message_id):
+        """Show main menu via callback"""
+        menu_text = """🤖 <b>Main Menu</b>
+
+Select an option below:"""
+        
+        keyboard = self.get_main_menu_keyboard()
+        self.edit_message_text(chat_id, message_id, menu_text, reply_markup=keyboard)
+    
+    def show_admins_menu(self, chat_id, message_id):
+        """Show admins management menu"""
+        menu_text = """👑 <b>Admins Management</b>
+
+Manage protected admins:
+• Add new admins
+• View current admins
+• Remove admins
+• Set individual delete times
+
+Select an option:"""
+        
+        keyboard = {
+            'inline_keyboard': [
+                [{'text': '➕ Add Admin', 'callback_data': 'add_admin'}],
+                [{'text': '📋 List Admins', 'callback_data': 'list_admins'}],
+                [{'text': '🗑️ Remove Admin', 'callback_data': 'remove_admin'}],
+                [{'text': '🔙 Back to Main', 'callback_data': 'main_menu'}]
+            ]
+        }
+        
+        self.edit_message_text(chat_id, message_id, menu_text, reply_markup=keyboard)
+    
+    def show_add_admin_menu(self, chat_id, message_id):
+        """Show add admin menu"""
+        menu_text = """➕ <b>Add Protected Admin</b>
+
+To add a protected admin, you need their Telegram User ID.
+
+What would you like to do?"""
+        
+        keyboard = {
+            'inline_keyboard': [
+                [{'text': '📝 Enter User ID Manually', 'callback_data': 'confirm_add_admin'}],
+                [{'text': '❓ How to Get User ID', 'callback_data': 'help_menu'}],
+                [{'text': '🔙 Back to Admins Menu', 'callback_data': 'admins_menu'}]
+            ]
+        }
+        
+        self.edit_message_text(chat_id, message_id, menu_text, reply_markup=keyboard)
+    
+    def request_admin_id(self, chat_id, message_id):
+        """Request admin ID from user"""
+        menu_text = """📝 <b>Enter User ID</b>
+
+Please send the User ID of the person you want to add as a protected admin.
+
+Format: Just send the number (e.g., 123456789)
+
+<i>Note: You can get User ID using @userinfobot or other Telegram bots.</i>"""
+        
+        keyboard = self.get_back_button()
+        self.edit_message_text(chat_id, message_id, menu_text, reply_markup=keyboard)
+    
+    def add_admin(self, chat_id, message_id, target_user_id, added_by):
+        """Add a new admin"""
+        try:
+            cursor = self.conn.cursor()
+            
+            # Check if already an admin
+            cursor.execute('SELECT id FROM channel_admins WHERE user_id = ? AND is_active = 1', (target_user_id,))
+            if cursor.fetchone():
+                success_text = f"""✅ <b>Already Protected</b>
+
+User ID: {target_user_id}
+Status: Already a protected admin
+
+Their posts will NOT be auto-deleted."""
                 
-                # Check if already an admin
-                cursor = self.conn.cursor()
-                cursor.execute('SELECT id FROM channel_admins WHERE user_id = ? AND is_active = 1', (target_user_id,))
-                if cursor.fetchone():
-                    self.send_message(chat_id, f"✅ User {target_user_id} is already a protected admin.")
-                    return
-                
-                # Add to database
-                first_name = f"User{target_user_id}"
-                cursor.execute('''
-                    INSERT INTO channel_admins 
-                    (user_id, username, first_name, added_by, delete_after_hours, is_active)
-                    VALUES (?, ?, ?, ?, 0, 1)
-                ''', (target_user_id, '', first_name, user_id))
-                
-                cursor.execute('UPDATE bot_stats SET total_admins_added = total_admins_added + 1 WHERE id = 1')
-                self.conn.commit()
-                
-                success_text = f"""✅ <b>Admin Added Successfully!</b>
+                keyboard = {
+                    'inline_keyboard': [
+                        [{'text': '📋 View All Admins', 'callback_data': 'list_admins'}],
+                        [{'text': '🔙 Back to Main', 'callback_data': 'main_menu'}]
+                    ]
+                }
+                self.edit_message_text(chat_id, message_id, success_text, reply_markup=keyboard)
+                return
+            
+            # Add to database
+            first_name = f"User{target_user_id}"
+            cursor.execute('''
+                INSERT INTO channel_admins 
+                (user_id, first_name, added_by, delete_after_seconds, is_active)
+                VALUES (?, ?, ?, 0, 1)
+            ''', (target_user_id, first_name, added_by))
+            
+            cursor.execute('UPDATE bot_stats SET total_admins_added = total_admins_added + 1 WHERE id = 1')
+            self.conn.commit()
+            
+            success_text = f"""✅ <b>Admin Added Successfully!</b>
 
 👤 User ID: {target_user_id}
-👑 Added by: {message['from'].get('first_name', 'You')}
+👑 Added by: Bot Owner
+⏰ Default Delete Time: Never (protected)
 
 📝 <b>What this means:</b>
 • This user can now post without auto-deletion
 • Their posts are protected
+• You can set custom delete time per admin
 • Other users' posts will still be deleted"""
-                
-                self.send_message(chat_id, success_text)
-                print(f"✅ Added user {target_user_id} as protected admin")
-                
-            except ValueError:
-                self.send_message(chat_id, "❌ Invalid user ID. Please use a number.")
-            except Exception as e:
-                print(f"❌ Error adding admin: {e}")
-                self.send_message(chat_id, f"❌ Error adding admin: {str(e)}")
-    
-    def handle_remove_admin(self, message):
-        """Handle /removeadmin command"""
-        chat_id = message['chat']['id']
-        user_id = message['from']['id']
-        
-        if not self.is_authorized_user(user_id):
-            self.send_message(chat_id, "❌ You are not authorized to use this command.")
-            return
-        
-        parts = message['text'].split(' ')
-        if len(parts) < 2:
-            self.send_message(chat_id, 
-                "📝 <b>Usage:</b> /removeadmin user_id\n\n"
-                "💡 <b>Example:</b>\n"
-                "/removeadmin 123456789\n\n"
-                "Use /listadmins to see user IDs")
-            return
-        
-        try:
-            target_user_id = int(parts[1])
             
-            cursor = self.conn.cursor()
-            cursor.execute('UPDATE channel_admins SET is_active = 0 WHERE user_id = ?', (target_user_id,))
+            keyboard = {
+                'inline_keyboard': [
+                    [{'text': '⏰ Set Delete Time for This Admin', 'callback_data': f'select_admin_{target_user_id}'}],
+                    [{'text': '📋 View All Admins', 'callback_data': 'list_admins'}],
+                    [{'text': '🔙 Back to Main', 'callback_data': 'main_menu'}]
+                ]
+            }
             
-            if cursor.rowcount > 0:
-                self.conn.commit()
-                self.send_message(chat_id, f"✅ User {target_user_id} removed from protected admins.")
-            else:
-                self.send_message(chat_id, f"❌ User {target_user_id} not found in protected admins.")
-                
-        except ValueError:
-            self.send_message(chat_id, "❌ Invalid user ID. Please use a number.")
+            self.edit_message_text(chat_id, message_id, success_text, reply_markup=keyboard)
+            print(f"✅ Added user {target_user_id} as protected admin")
+            
         except Exception as e:
-            print(f"❌ Error removing admin: {e}")
-            self.send_message(chat_id, f"❌ Error: {str(e)}")
+            error_text = f"""❌ <b>Error Adding Admin</b>
+
+Error: {str(e)}
+
+Please try again or contact support."""
+            
+            keyboard = self.get_back_button()
+            self.edit_message_text(chat_id, message_id, error_text, reply_markup=keyboard)
+            print(f"❌ Error adding admin: {e}")
     
-    def handle_list_admins(self, message):
-        """Handle /listadmins command"""
-        chat_id = message['chat']['id']
-        
+    def show_list_admins(self, chat_id, message_id):
+        """Show list of all protected admins"""
         cursor = self.conn.cursor()
         cursor.execute('''
-            SELECT user_id, first_name, delete_after_hours, added_at 
+            SELECT user_id, first_name, delete_after_seconds, added_at 
             FROM channel_admins 
             WHERE is_active = 1 
             ORDER BY added_at DESC
@@ -697,68 +867,302 @@ Need help? Use /help for detailed instructions."""
         admins = cursor.fetchall()
         
         if not admins:
-            self.send_message(chat_id, "📭 No protected admins found.")
-            return
-        
-        admin_list = "👑 <b>Protected Admins (Posts NOT deleted):</b>\n\n"
-        
-        for admin in admins:
-            user_id, first_name, delete_hours, added_at = admin
-            added_date = datetime.fromisoformat(added_at).strftime('%Y-%m-%d')
+            menu_text = """📭 <b>No Protected Admins</b>
+
+There are no protected admins yet.
+Add your first admin using the button below."""
             
-            admin_list += f"• {first_name}\n"
-            admin_list += f"  🆔 ID: {user_id}\n"
-            if delete_hours > 0:
-                admin_list += f"  ⏰ Delete after: {delete_hours} hours\n"
-            else:
-                admin_list += f"  ⏰ Delete: Never\n"
-            admin_list += f"  📅 Added: {added_date}\n\n"
+            keyboard = {
+                'inline_keyboard': [
+                    [{'text': '➕ Add First Admin', 'callback_data': 'add_admin'}],
+                    [{'text': '🔙 Back to Main', 'callback_data': 'main_menu'}]
+                ]
+            }
+        else:
+            admin_list = "👑 <b>Protected Admins</b>\n\n"
+            
+            for i, admin in enumerate(admins, 1):
+                user_id, first_name, delete_seconds, added_at = admin
+                added_date = datetime.fromisoformat(added_at).strftime('%Y-%m-%d')
+                
+                # Format delete time
+                if delete_seconds == 0:
+                    delete_time = "Never"
+                else:
+                    delete_time = self.format_seconds(delete_seconds)
+                
+                admin_list += f"{i}. {first_name}\n"
+                admin_list += f"   🆔: {user_id}\n"
+                admin_list += f"   ⏰: {delete_time}\n"
+                admin_list += f"   📅: {added_date}\n\n"
+            
+            admin_list += f"<i>Total: {len(admins)} protected admin(s)</i>"
+            menu_text = admin_list
+            
+            # Create buttons for each admin
+            keyboard_rows = []
+            for admin in admins[:10]:  # Limit to 10 admins for button space
+                user_id, first_name, _, _ = admin
+                keyboard_rows.append([
+                    {'text': f"⚙️ {first_name}", 'callback_data': f'select_admin_{user_id}'}
+                ])
+            
+            keyboard_rows.append([{'text': '🔙 Back to Admins Menu', 'callback_data': 'admins_menu'}])
+            
+            keyboard = {'inline_keyboard': keyboard_rows}
         
-        self.send_message(chat_id, admin_list)
+        self.edit_message_text(chat_id, message_id, menu_text, reply_markup=keyboard)
     
-    def handle_set_time(self, message):
-        """Handle /settime command"""
-        chat_id = message['chat']['id']
-        user_id = message['from']['id']
+    def show_admin_time_menu(self, chat_id, message_id, admin_id):
+        """Show time menu for a specific admin"""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT first_name, delete_after_seconds FROM channel_admins WHERE user_id = ?', (admin_id,))
+        admin = cursor.fetchone()
         
-        if not self.is_authorized_user(user_id):
-            self.send_message(chat_id, "❌ You are not authorized to use this command.")
-            return
-        
-        parts = message['text'].split(' ')
-        if len(parts) < 2:
-            self.send_message(chat_id, 
-                "📝 <b>Usage:</b> /settime hours\n\n"
-                "💡 <b>Examples:</b>\n"
-                "/settime 24 - Delete after 24 hours\n"
-                "/settime 0 - Delete immediately\n"
-                "/settime 168 - Delete after 1 week\n\n"
-                "This applies to NON-ADMIN posts only.")
-            return
-        
-        try:
-            delete_hours = int(parts[1])
+        if not admin:
+            menu_text = "❌ Admin not found."
+            keyboard = self.get_back_button()
+        else:
+            first_name, current_seconds = admin
+            current_time = self.format_seconds(current_seconds) if current_seconds > 0 else "Never"
             
-            if delete_hours < 0:
-                self.send_message(chat_id, "❌ Delete time cannot be negative.")
+            menu_text = f"""⚙️ <b>Admin Settings: {first_name}</b>
+
+🆔 User ID: {admin_id}
+⏰ Current Delete Time: {current_time}
+
+Select new delete time for this admin:"""
+            
+            keyboard = {
+                'inline_keyboard': [
+                    [{'text': '30 Seconds', 'callback_data': f'admin_time_{admin_id}_30s'}],
+                    [{'text': '1 Minute', 'callback_data': f'admin_time_{admin_id}_1m'}],
+                    [{'text': '5 Minutes', 'callback_data': f'admin_time_{admin_id}_5m'}],
+                    [{'text': '10 Minutes', 'callback_data': f'admin_time_{admin_id}_10m'}],
+                    [{'text': '1 Hour', 'callback_data': f'admin_time_{admin_id}_1h'}],
+                    [{'text': '2 Hours', 'callback_data': f'admin_time_{admin_id}_2h'}],
+                    [{'text': '12 Hours', 'callback_data': f'admin_time_{admin_id}_12h'}],
+                    [{'text': '24 Hours', 'callback_data': f'admin_time_{admin_id}_24h'}],
+                    [{'text': '❌ Never (Protected)', 'callback_data': f'admin_time_{admin_id}_never'}],
+                    [{'text': '🗑️ Remove This Admin', 'callback_data': f'delete_admin_{admin_id}'}],
+                    [{'text': '🔙 Back to Admin List', 'callback_data': 'list_admins'}]
+                ]
+            }
+        
+        self.edit_message_text(chat_id, message_id, menu_text, reply_markup=keyboard)
+    
+    def set_admin_delete_time(self, chat_id, message_id, admin_id, time_key, user_id):
+        """Set delete time for a specific admin"""
+        try:
+            seconds = DELETE_TIME_OPTIONS.get(time_key, 0)
+            
+            cursor = self.conn.cursor()
+            cursor.execute('SELECT first_name FROM channel_admins WHERE user_id = ?', (admin_id,))
+            admin = cursor.fetchone()
+            
+            if not admin:
+                self.edit_message_text(chat_id, message_id, 
+                    "❌ Admin not found.",
+                    reply_markup=self.get_back_button())
                 return
             
-            self.send_message(chat_id, 
-                f"✅ Non-admin posts will be deleted after {delete_hours} hours.\n"
-                f"Protected admins' posts will NOT be deleted.")
-                
-        except ValueError:
-            self.send_message(chat_id, "❌ Invalid input. Please use a number.")
+            first_name = admin[0]
+            cursor.execute('UPDATE channel_admins SET delete_after_seconds = ? WHERE user_id = ?', 
+                         (seconds, admin_id))
+            self.conn.commit()
+            
+            time_text = self.format_seconds(seconds) if seconds > 0 else "Never (protected)"
+            
+            success_text = f"""✅ <b>Delete Time Updated</b>
+
+👤 Admin: {first_name}
+🆔 User ID: {admin_id}
+⏰ New Delete Time: {time_text}
+
+📝 <b>Effect:</b>
+• Posts from this admin will be deleted after {time_text.lower()}
+• {f'Posts will be protected for {time_text}' if seconds > 0 else 'Posts will never be deleted'}
+• Time applies only to this specific admin"""
+            
+            keyboard = {
+                'inline_keyboard': [
+                    [{'text': '⚙️ Back to Admin Settings', 'callback_data': f'select_admin_{admin_id}'}],
+                    [{'text': '📋 View All Admins', 'callback_data': 'list_admins'}],
+                    [{'text': '🔙 Main Menu', 'callback_data': 'main_menu'}]
+                ]
+            }
+            
+            self.edit_message_text(chat_id, message_id, success_text, reply_markup=keyboard)
+            print(f"✅ Set delete time for admin {admin_id} to {time_key}")
+            
         except Exception as e:
-            print(f"❌ Error setting time: {e}")
-            self.send_message(chat_id, f"❌ Error: {str(e)}")
+            self.edit_message_text(chat_id, message_id,
+                f"❌ Error updating delete time: {str(e)}",
+                reply_markup=self.get_back_button())
+            print(f"❌ Error setting admin delete time: {e}")
     
-    def handle_stats(self, message):
-        """Handle /stats command"""
-        chat_id = message['chat']['id']
+    def delete_admin(self, chat_id, message_id, admin_id, user_id):
+        """Delete an admin"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('SELECT first_name FROM channel_admins WHERE user_id = ?', (admin_id,))
+            admin = cursor.fetchone()
+            
+            if not admin:
+                self.edit_message_text(chat_id, message_id,
+                    "❌ Admin not found.",
+                    reply_markup=self.get_back_button())
+                return
+            
+            first_name = admin[0]
+            cursor.execute('UPDATE channel_admins SET is_active = 0 WHERE user_id = ?', (admin_id,))
+            self.conn.commit()
+            
+            success_text = f"""🗑️ <b>Admin Removed</b>
+
+👤 Admin: {first_name}
+🆔 User ID: {admin_id}
+⏰ Status: ❌ No longer protected
+
+📝 <b>Effect:</b>
+• This user's posts will now be auto-deleted
+• They are removed from protected admins list
+• Their posts follow global delete time settings"""
+            
+            keyboard = {
+                'inline_keyboard': [
+                    [{'text': '📋 View Remaining Admins', 'callback_data': 'list_admins'}],
+                    [{'text': '➕ Add New Admin', 'callback_data': 'add_admin'}],
+                    [{'text': '🔙 Main Menu', 'callback_data': 'main_menu'}]
+                ]
+            }
+            
+            self.edit_message_text(chat_id, message_id, success_text, reply_markup=keyboard)
+            print(f"✅ Removed admin {admin_id}")
+            
+        except Exception as e:
+            self.edit_message_text(chat_id, message_id,
+                f"❌ Error removing admin: {str(e)}",
+                reply_markup=self.get_back_button())
+            print(f"❌ Error removing admin: {e}")
+    
+    def show_remove_admin_menu(self, chat_id, message_id):
+        """Show remove admin menu"""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT user_id, first_name FROM channel_admins WHERE is_active = 1 ORDER BY first_name')
+        admins = cursor.fetchall()
+        
+        if not admins:
+            menu_text = """📭 <b>No Admins to Remove</b>
+
+There are no protected admins to remove.
+Add some admins first."""
+            
+            keyboard = {
+                'inline_keyboard': [
+                    [{'text': '➕ Add First Admin', 'callback_data': 'add_admin'}],
+                    [{'text': '🔙 Back to Admins Menu', 'callback_data': 'admins_menu'}]
+                ]
+            }
+        else:
+            menu_text = """🗑️ <b>Remove Admin</b>
+
+Select an admin to remove from protection:
+
+<i>Note: Removing an admin means their posts will be auto-deleted.</i>"""
+            
+            keyboard_rows = []
+            for admin in admins[:10]:  # Limit to 10 for space
+                user_id, first_name = admin
+                keyboard_rows.append([
+                    {'text': f"❌ Remove {first_name}", 'callback_data': f'delete_admin_{user_id}'}
+                ])
+            
+            keyboard_rows.append([{'text': '🔙 Back to Admins Menu', 'callback_data': 'admins_menu'}])
+            keyboard = {'inline_keyboard': keyboard_rows}
+        
+        self.edit_message_text(chat_id, message_id, menu_text, reply_markup=keyboard)
+    
+    def show_time_menu(self, chat_id, message_id):
+        """Show global delete time menu"""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT global_delete_seconds FROM global_settings WHERE id = 1')
+        result = cursor.fetchone()
+        current_seconds = result[0] if result else 86400
+        current_time = self.format_seconds(current_seconds)
+        
+        menu_text = f"""⏰ <b>Global Delete Time Settings</b>
+
+Current setting: {current_time}
+
+This applies to ALL non-admin posts.
+Protected admins have individual settings.
+
+Select new global delete time:"""
+        
+        keyboard = {
+            'inline_keyboard': [
+                [{'text': '30 Seconds', 'callback_data': 'set_time_30s'}],
+                [{'text': '1 Minute', 'callback_data': 'set_time_1m'}],
+                [{'text': '5 Minutes', 'callback_data': 'set_time_5m'}],
+                [{'text': '10 Minutes', 'callback_data': 'set_time_10m'}],
+                [{'text': '1 Hour', 'callback_data': 'set_time_1h'}],
+                [{'text': '2 Hours', 'callback_data': 'set_time_2h'}],
+                [{'text': '12 Hours', 'callback_data': 'set_time_12h'}],
+                [{'text': '24 Hours', 'callback_data': 'set_time_24h'}],
+                [{'text': '🔙 Back to Main', 'callback_data': 'main_menu'}]
+            ]
+        }
+        
+        self.edit_message_text(chat_id, message_id, menu_text, reply_markup=keyboard)
+    
+    def set_global_delete_time(self, chat_id, message_id, time_key, user_id):
+        """Set global delete time"""
+        try:
+            seconds = DELETE_TIME_OPTIONS.get(time_key, 86400)
+            
+            cursor = self.conn.cursor()
+            cursor.execute('UPDATE global_settings SET global_delete_seconds = ? WHERE id = 1', (seconds,))
+            self.conn.commit()
+            
+            time_text = self.format_seconds(seconds)
+            
+            success_text = f"""✅ <b>Global Delete Time Updated</b>
+
+⏰ New Setting: {time_text}
+
+📝 <b>Effect:</b>
+• All non-admin posts will be deleted after {time_text.lower()}
+• Protected admins' posts follow their individual settings
+• New posts will use this setting immediately
+• Existing scheduled posts will use their original settings"""
+            
+            keyboard = {
+                'inline_keyboard': [
+                    [{'text': '⚙️ Back to Time Settings', 'callback_data': 'time_menu'}],
+                    [{'text': '👑 Manage Admin Times', 'callback_data': 'admins_menu'}],
+                    [{'text': '🔙 Main Menu', 'callback_data': 'main_menu'}]
+                ]
+            }
+            
+            self.edit_message_text(chat_id, message_id, success_text, reply_markup=keyboard)
+            print(f"✅ Set global delete time to {time_key}")
+            
+        except Exception as e:
+            self.edit_message_text(chat_id, message_id,
+                f"❌ Error updating delete time: {str(e)}",
+                reply_markup=self.get_back_button())
+            print(f"❌ Error setting global delete time: {e}")
+    
+    def show_stats(self, chat_id, message_id):
+        """Show bot statistics"""
         stats = self.get_system_stats()
         
         cursor = self.conn.cursor()
+        cursor.execute('SELECT global_delete_seconds FROM global_settings WHERE id = 1')
+        global_time = cursor.fetchone()[0]
+        global_time_text = self.format_seconds(global_time)
+        
         cursor.execute('SELECT COUNT(*) FROM bot_owners')
         owner_count = cursor.fetchone()[0]
         
@@ -771,46 +1175,81 @@ Need help? Use /help for detailed instructions."""
 💬 Comments Detected: {stats.get('total_comments_detected', 0)}
 ⏰ Pending Deletions: {stats.get('pending_deletions', 0)}
 
-🛡️ <b>Protection Status:</b>
-• Deleting non-admin posts: ✅ Active
-• Comment detection: ✅ Active
-• Owner notifications: ✅ Active"""
+⚙️ <b>Settings:</b>
+• Global Delete Time: {global_time_text}
+• Comment Notifications: ✅ Active
+• Auto-Deletion: ✅ Active
 
-        self.send_message(chat_id, stats_text)
-    
-    def handle_help(self, message):
-        """Handle /help command"""
-        chat_id = message['chat']['id']
+🛡️ <b>Protection Status:</b>
+✅ All systems operational"""
         
+        keyboard = {
+            'inline_keyboard': [
+                [{'text': '⏰ Change Global Time', 'callback_data': 'time_menu'}],
+                [{'text': '🔄 Refresh Stats', 'callback_data': 'stats_menu'}],
+                [{'text': '🔙 Back to Main', 'callback_data': 'main_menu'}]
+            ]
+        }
+        
+        self.edit_message_text(chat_id, message_id, stats_text, reply_markup=keyboard)
+    
+    def show_help_menu(self, message):
+        """Show help menu via command"""
+        chat_id = message['chat']['id']
+        user_id = message['from']['id']
+        
+        if not self.is_authorized_user(user_id):
+            self.send_message(chat_id, 
+                "❌ You are not authorized to use this bot.\n"
+                "Only bot owners can access these controls.")
+            return
+        
+        self.show_help(chat_id, None)
+    
+    def show_help(self, chat_id, message_id):
+        """Show help information"""
         help_text = """📚 <b>Channel Protection Bot Help</b>
 
 🤖 <b>About:</b>
 I automatically delete posts from non-admins and notify about comments.
 
-👑 <b>Admin Commands:</b>
-• /addadmin user_id - Add user as protected admin
-• /removeadmin user_id - Remove admin protection
-• /listadmins - List all protected admins
-• /settime hours - Set delete time for non-admins
-• /stats - Show bot statistics
-• /help - Show this help
+👑 <b>Protected Admins:</b>
+• Admins' posts are NOT deleted (or deleted after custom time)
+• Each admin can have individual delete time
+• Use the Admins menu to manage them
 
-🔧 <b>Setup Instructions:</b>
+⏰ <b>Delete Times:</b>
+• Global time applies to all non-admins
+• Admin-specific time overrides global for that admin
+• Times range from 30 seconds to 24 hours
+• "Never" means posts are protected
+
+🔔 <b>Notifications:</b>
+• All bot owners get notified about comments
+• Notifications include message links
+• Comment detection is automatic
+
+⚙️ <b>Setup:</b>
 1. Add me as admin to your channel
 2. Grant me delete message permission
-3. Use /addadmin to add trusted users
-4. Non-admin posts will auto-delete
+3. Add trusted users as protected admins
+4. Set delete times as needed
 
-⚠️ <b>How It Works:</b>
-• Protected admins' posts: NOT deleted
-• Non-admin posts: Auto-deleted after specified time
-• Comments/replies: All bot owners get notified with link
-• All deletions are logged
+❓ <b>How to Get User ID:</b>
+Use @userinfobot or forward a message from the user to @getidsbot"""
 
-📞 <b>Support:</b>
-Contact the bot owners for help."""
+        keyboard = {
+            'inline_keyboard': [
+                [{'text': '👑 Manage Admins', 'callback_data': 'admins_menu'}],
+                [{'text': '⏰ Set Global Time', 'callback_data': 'time_menu'}],
+                [{'text': '🔙 Main Menu', 'callback_data': 'main_menu'}]
+            ]
+        }
         
-        self.send_message(chat_id, help_text)
+        if message_id:
+            self.edit_message_text(chat_id, message_id, help_text, reply_markup=keyboard)
+        else:
+            self.send_message(chat_id, help_text, reply_markup=keyboard)
     
     def handle_group_channel_message(self, message):
         """Handle messages in groups/channels"""
@@ -838,32 +1277,42 @@ Contact the bot owners for help."""
             
             # Check if user is a protected admin
             cursor = self.conn.cursor()
-            cursor.execute('SELECT id FROM channel_admins WHERE user_id = ? AND is_active = 1', (user_id,))
-            is_protected_admin = cursor.fetchone() is not None
+            cursor.execute('SELECT delete_after_seconds FROM channel_admins WHERE user_id = ? AND is_active = 1', (user_id,))
+            admin_result = cursor.fetchone()
             
-            if is_protected_admin:
-                print(f"✅ Protected admin {user_name} ({user_id}) posted in {chat_id} - NOT deleting")
+            if admin_result:
+                # User is protected admin - use their specific delete time
+                delete_seconds = admin_result[0]
+                print(f"✅ Protected admin {user_name} ({user_id}) posted in {chat_id}")
+                
+                if delete_seconds == 0:
+                    print(f"   ⏰ Admin posts are protected - NOT deleting")
+                    return
+                else:
+                    print(f"   ⏰ Admin posts will be deleted after {self.format_seconds(delete_seconds)}")
+            else:
+                # Non-admin user - use global delete time
+                cursor.execute('SELECT global_delete_seconds FROM global_settings WHERE id = 1')
+                delete_seconds = cursor.fetchone()[0]
+                print(f"⚠️ Non-admin {user_name} ({user_id}) posted in {chat_id} - Will delete after {self.format_seconds(delete_seconds)}")
+            
+            # If delete_seconds is 0, don't schedule deletion
+            if delete_seconds == 0:
                 return
-            
-            # Non-admin user - schedule deletion
-            print(f"⚠️ Non-admin {user_name} ({user_id}) posted in {chat_id} - Scheduling deletion")
-            
-            # Get delete time (default 24 hours)
-            delete_hours = 24
             
             # Extract message content
             post_content = self.extract_message_content(message)
             post_type = self.get_message_type(message)
             
             # Schedule deletion
-            scheduled_time = datetime.now() + timedelta(hours=delete_hours)
+            scheduled_time = datetime.now() + timedelta(seconds=delete_seconds)
             
             cursor.execute('''
                 INSERT OR IGNORE INTO non_admin_posts 
-                (channel_id, message_id, user_id, user_name, delete_after_hours, 
+                (channel_id, message_id, user_id, user_name, delete_after_seconds, 
                  scheduled_delete_time, post_content, post_type)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (chat_id, message_id, user_id, user_name, delete_hours, 
+            ''', (chat_id, message_id, user_id, user_name, delete_seconds, 
                   scheduled_time, post_content, post_type))
             
             self.conn.commit()
@@ -953,10 +1402,6 @@ Contact the bot owners for help."""
         except Exception as e:
             print(f"❌ Error handling comment: {e}")
     
-    def handle_callback_query(self, callback_query):
-        """Handle callback queries"""
-        pass
-    
     def extract_message_content(self, message):
         """Extract text content from message"""
         if 'text' in message:
@@ -1008,6 +1453,39 @@ Contact the bot owners for help."""
                 return f"Message ID: {message_id} in Chat: {chat_id}"
         except:
             return f"Message ID: {message_id}"
+    
+    def format_seconds(self, seconds):
+        """Format seconds to human readable time"""
+        if seconds < 60:
+            return f"{seconds} seconds"
+        elif seconds < 3600:
+            minutes = seconds // 60
+            return f"{minutes} minute{'s' if minutes > 1 else ''}"
+        elif seconds < 86400:
+            hours = seconds // 3600
+            return f"{hours} hour{'s' if hours > 1 else ''}"
+        else:
+            days = seconds // 86400
+            return f"{days} day{'s' if days > 1 else ''}"
+    
+    def get_main_menu_keyboard(self):
+        """Get main menu keyboard"""
+        return {
+            'inline_keyboard': [
+                [{'text': '👑 Manage Admins', 'callback_data': 'admins_menu'}],
+                [{'text': '⏰ Set Delete Time', 'callback_data': 'time_menu'}],
+                [{'text': '📊 View Stats', 'callback_data': 'stats_menu'}],
+                [{'text': '❓ Help', 'callback_data': 'help_menu'}]
+            ]
+        }
+    
+    def get_back_button(self):
+        """Get back button keyboard"""
+        return {
+            'inline_keyboard': [
+                [{'text': '🔙 Back to Main', 'callback_data': 'main_menu'}]
+            ]
+        }
     
     def is_authorized_user(self, user_id):
         """Check if user is authorized to use admin commands"""
@@ -1104,14 +1582,10 @@ Contact the bot owners for help."""
         print("  • Delete non-admin posts ✅")
         print("  • Comment detection ✅")
         print("  • Owner notifications ✅")
-        print("  • Auto-delete scheduling ✅")
+        print("  • Auto-delete scheduling with inline buttons ✅")
         print("\n📋 Available Commands:")
         print("  • /start - Start bot")
-        print("  • /addadmin - Add protected admin")
-        print("  • /removeadmin - Remove admin")
-        print("  • /listadmins - List protected admins")
-        print("  • /settime - Set delete time (non-admins)")
-        print("  • /stats - Show statistics")
+        print("  • /menu - Show main menu")
         print("  • /help - Show help")
         print(f"\n👥 Bot Owners: {len(self.owner_ids)} users")
         
