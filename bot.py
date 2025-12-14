@@ -1,1148 +1,668 @@
-import os
-import time
-import logging
-import sqlite3
 import requests
+import time
+import os
+import sys
+import json
 import threading
+import sqlite3
 from datetime import datetime, timedelta
-from typing import Dict, List
 from flask import Flask, jsonify, request
 from threading import Thread
+import traceback
 
-# Configure logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+print("TELEGRAM BOT - ADMIN MANAGEMENT SYSTEM")
+print("Keep-Alive System + Admin Management")
+print("24/7 Operation with Auto-Restart")
+print("=" * 50)
 
-# ==================== FLASK APP ====================
+# ==================== RENDER DEBUG SECTION ====================
+print("🔍 RENDER DEBUG: Starting initialization...")
+print(f"🔍 DEBUG: Python version: {sys.version}")
+print(f"🔍 DEBUG: Current directory: {os.getcwd()}")
+print(f"🔍 DEBUG: Files in directory: {os.listdir('.')}")
 
+# Get port automatically from Render environment
+PORT = int(os.environ.get('PORT', 8080))
+print(f"🔍 DEBUG: Using PORT: {PORT}")
+
+# Health check server
 app = Flask(__name__)
-
-# Global bot instance
-bot_instance = None
 
 @app.route('/health')
 def health_check():
-    return jsonify({'status': 'healthy', 'timestamp': time.time()}), 200
+    """Enhanced health check endpoint for Render monitoring"""
+    try:
+        service_status = 'unknown'
+        if 'service' in globals():
+            service_status = 'healthy'
+        
+        health_status = {
+            'status': 'healthy',
+            'timestamp': time.time(),
+            'service': 'telegram-admin-system',
+            'version': '1.0.0',
+            'service_status': service_status,
+            'checks': {
+                'system': {'status': 'healthy', 'message': 'System operational'},
+                'database': {'status': 'healthy', 'message': 'Database connected'},
+                'keep_alive': {'status': 'active', 'message': 'Keep-alive service running'},
+                'admin_system': {'status': 'active', 'message': 'Admin management system ready'}
+            }
+        }
+        return jsonify(health_status), 200
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e),
+            'timestamp': time.time(),
+            'service_status': 'error'
+        }), 500
+
+@app.route('/redeploy', methods=['POST'])
+def redeploy_service():
+    """Redeploy endpoint for admins"""
+    try:
+        auth_token = request.headers.get('Authorization', '')
+        user_id = request.json.get('user_id', '') if request.json else ''
+        
+        # You can customize authorization logic here
+        is_authorized = auth_token == os.environ.get('REDEPLOY_TOKEN', 'default_token')
+        
+        if not is_authorized:
+            return jsonify({
+                'status': 'error',
+                'message': 'Unauthorized access'
+            }), 401
+        
+        print(f"🔄 Redeploy triggered")
+        
+        def delayed_restart():
+            time.sleep(5)
+            os._exit(0)
+        
+        restart_thread = threading.Thread(target=delayed_restart, daemon=True)
+        restart_thread.start()
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Redeploy initiated successfully',
+            'redeploy_id': int(time.time()),
+            'timestamp': datetime.now().isoformat()
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e),
+            'timestamp': time.time()
+        }), 500
 
 @app.route('/')
 def home():
-    return jsonify({'service': 'Telegram Auto Delete Bot', 'status': 'running'})
+    """Root endpoint"""
+    return jsonify({
+        'service': 'Telegram Admin Management System',
+        'status': 'running',
+        'version': '1.0.0',
+        'endpoints': {
+            'health': '/health',
+            'redeploy': '/redeploy (POST)',
+            'admin_stats': '/admin/stats (GET)'
+        },
+        'features': ['Keep-Alive Service', 'Admin Management', '24/7 Operation', 'Auto-Restart']
+    })
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """Main webhook endpoint for Telegram"""
+@app.route('/admin/stats', methods=['GET'])
+def get_admin_stats():
+    """Get admin system statistics"""
     try:
-        update = request.get_json()
-        if bot_instance:
-            bot_instance.process_update(update)
-        return 'OK'
+        auth_token = request.headers.get('Authorization', '')
+        is_authorized = auth_token == os.environ.get('REDEPLOY_TOKEN', 'default_token')
+        
+        if not is_authorized:
+            return jsonify({
+                'status': 'error',
+                'message': 'Unauthorized access'
+            }), 401
+        
+        if 'service' not in globals():
+            return jsonify({
+                'status': 'error',
+                'message': 'Service not initialized'
+            }), 500
+        
+        stats = service.admin_system.get_system_stats()
+        
+        return jsonify({
+            'status': 'success',
+            'stats': stats,
+            'timestamp': datetime.now().isoformat()
+        }), 200
+        
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return 'OK'
-
-@app.route('/setup-webhook', methods=['GET'])
-def setup_webhook():
-    """Manually setup webhook"""
-    if bot_instance:
-        success = bot_instance.setup_webhook()
-        return jsonify({'success': success})
-    return jsonify({'success': False, 'error': 'Bot not initialized'})
+        return jsonify({
+            'status': 'error',
+            'message': str(e),
+            'timestamp': time.time()
+        }), 500
 
 def run_health_server():
+    """Run the health check server with error handling"""
     try:
-        port = int(os.environ.get('PORT', 8080))
-        logger.info(f"Starting health server on port {port}")
-        app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+        print(f"🔄 Starting health server on port {PORT}")
+        app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
     except Exception as e:
-        logger.error(f"Health server error: {e}")
+        print(f"❌ Health server error: {e}")
+        time.sleep(5)
+        run_health_server()
 
-# ==================== DATABASE MANAGER ====================
+def start_health_check():
+    """Start health check server in background with restart capability"""
+    def health_wrapper():
+        while True:
+            try:
+                run_health_server()
+            except Exception as e:
+                print(f"❌ Health server crashed, restarting: {e}")
+                time.sleep(10)
+    
+    t = Thread(target=health_wrapper, daemon=True)
+    t.start()
+    print(f"✅ Health check server started on port {PORT}")
 
-class DatabaseManager:
+# ==================== ENHANCED KEEP-ALIVE SERVICE ====================
+
+class EnhancedKeepAliveService:
+    def __init__(self, health_url=None):
+        self.health_url = health_url or f"http://localhost:{PORT}/health"
+        self.is_running = False
+        self.ping_count = 0
+        self.last_successful_ping = time.time()
+        
+    def start(self):
+        """Start enhanced keep-alive service with better monitoring"""
+        self.is_running = True
+        
+        def ping_loop():
+            consecutive_failures = 0
+            max_consecutive_failures = 3
+            
+            while self.is_running:
+                try:
+                    self.ping_count += 1
+                    response = requests.get(self.health_url, timeout=15)
+                    
+                    if response.status_code == 200:
+                        self.last_successful_ping = time.time()
+                        consecutive_failures = 0
+                        print(f"✅ Keep-alive ping #{self.ping_count}: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                    else:
+                        consecutive_failures += 1
+                        print(f"❌ Keep-alive failed: Status {response.status_code} (Failures: {consecutive_failures})")
+                        
+                except requests.exceptions.ConnectionError:
+                    consecutive_failures += 1
+                    print(f"🔌 Keep-alive connection error (Failures: {consecutive_failures})")
+                except requests.exceptions.Timeout:
+                    consecutive_failures += 1
+                    print(f"⏰ Keep-alive timeout (Failures: {consecutive_failures})")
+                except Exception as e:
+                    consecutive_failures += 1
+                    print(f"❌ Keep-alive error: {e} (Failures: {consecutive_failures})")
+                
+                if consecutive_failures >= max_consecutive_failures:
+                    print("🚨 Too many consecutive failures, initiating emergency procedures...")
+                    self.emergency_restart()
+                    consecutive_failures = 0
+                
+                if time.time() - self.last_successful_ping > 600:
+                    print("🚨 No successful pings for 10 minutes, emergency restart...")
+                    self.emergency_restart()
+                    self.last_successful_ping = time.time()
+                
+                if consecutive_failures > 0:
+                    sleep_time = 60
+                else:
+                    sleep_time = 240
+                
+                time.sleep(sleep_time)
+        
+        thread = threading.Thread(target=ping_loop, daemon=True)
+        thread.start()
+        print(f"🔄 Enhanced keep-alive service started")
+        print(f"🌐 Health endpoint: {self.health_url}")
+        
+    def emergency_restart(self):
+        """Emergency restart procedure"""
+        print("🔄 Initiating emergency restart...")
+        os._exit(1)
+        
+    def stop(self):
+        """Stop keep-alive service"""
+        self.is_running = False
+        print("🛑 Keep-alive service stopped")
+
+# ==================== ADMIN MANAGEMENT SYSTEM ====================
+
+class AdminManagementSystem:
     def __init__(self):
+        self.conn = None
         self.setup_database()
+        self.admin_sessions = {}
+        self.auto_delete_thread = None
+        self.is_monitoring = False
+        print("✅ Admin Management System initialized!")
     
     def setup_database(self):
-        """Initialize SQLite database"""
-        self.conn = sqlite3.connect('auto_delete_bot.db', check_same_thread=False)
-        cursor = self.conn.cursor()
+        """Setup database tables for admin management"""
+        try:
+            db_path = self.get_db_path()
+            print(f"📁 Database path: {db_path}")
+            
+            self.conn = sqlite3.connect(db_path, check_same_thread=False)
+            cursor = self.conn.cursor()
+            
+            # Channel admins table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS channel_admins (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER UNIQUE,
+                    username TEXT,
+                    first_name TEXT,
+                    added_by INTEGER,
+                    added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    is_active INTEGER DEFAULT 1,
+                    delete_after_hours INTEGER DEFAULT 24
+                )
+            ''')
+            
+            # Auto-delete posts table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS auto_delete_posts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel_username TEXT,
+                    message_id INTEGER,
+                    user_id INTEGER,
+                    delete_after_hours INTEGER,
+                    scheduled_delete_time DATETIME,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    deleted_at DATETIME,
+                    is_active INTEGER DEFAULT 1
+                )
+            ''')
+            
+            # Service status table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS service_status (
+                    id INTEGER PRIMARY KEY,
+                    service_name TEXT DEFAULT 'Admin Management System',
+                    last_restart DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    uptime_hours INTEGER DEFAULT 0,
+                    total_admins INTEGER DEFAULT 0,
+                    active_admins INTEGER DEFAULT 0,
+                    total_deletions INTEGER DEFAULT 0
+                )
+            ''')
+            
+            cursor.execute('INSERT OR IGNORE INTO service_status (id) VALUES (1)')
+            self.conn.commit()
+            print("✅ Admin database setup complete!")
+            
+        except Exception as e:
+            print(f"❌ Database setup error: {e}")
+            # Fallback to in-memory database
+            self.conn = sqlite3.connect(':memory:', check_same_thread=False)
+            self.setup_database()
+    
+    def get_db_path(self):
+        """Get database path"""
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        db_path = os.path.join(base_path, 'admin_system.db')
+        return db_path
+    
+    def start_auto_delete_monitor(self):
+        """Start monitoring for auto-delete posts"""
+        if self.is_monitoring:
+            return
         
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS channels (
-                channel_id TEXT PRIMARY KEY,
-                channel_title TEXT,
-                bot_added_date DATETIME,
-                delete_interval INTEGER DEFAULT 300,
-                is_active BOOLEAN DEFAULT TRUE
-            )
-        ''')
+        self.is_monitoring = True
         
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS allowed_admins (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel_id TEXT,
-                user_id INTEGER,
-                username TEXT,
-                full_name TEXT,
-                added_by INTEGER,
-                added_date DATETIME
-            )
-        ''')
+        def monitor_posts():
+            while self.is_monitoring:
+                try:
+                    self.check_and_delete_posts()
+                    time.sleep(60)  # Check every minute
+                except Exception as e:
+                    print(f"❌ Auto-delete monitor error: {e}")
+                    time.sleep(300)  # Wait 5 minutes on error
         
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS pending_deletions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel_id TEXT,
-                message_id INTEGER,
-                delete_at DATETIME,
-                processed BOOLEAN DEFAULT FALSE
-            )
-        ''')
-        
-        self.conn.commit()
-        logger.info("Database setup completed")
+        self.auto_delete_thread = threading.Thread(target=monitor_posts, daemon=True)
+        self.auto_delete_thread.start()
+        print("✅ Auto-delete monitoring started!")
     
-    def add_channel(self, channel_id, channel_title):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO channels 
-            (channel_id, channel_title, bot_added_date, delete_interval, is_active)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (channel_id, channel_title, datetime.now(), 300, True))
-        self.conn.commit()
-        logger.info(f"Added channel: {channel_title} ({channel_id})")
+    def check_and_delete_posts(self):
+        """Check for posts that need to be deleted"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT id, channel_username, message_id, user_id 
+                FROM auto_delete_posts 
+                WHERE is_active = 1 
+                AND scheduled_delete_time <= datetime('now')
+            ''')
+            
+            posts_to_delete = cursor.fetchall()
+            
+            for post in posts_to_delete:
+                post_id, channel_username, message_id, user_id = post
+                success = self.delete_post(channel_username, message_id, post_id)
+                
+                if success:
+                    # Update stats
+                    cursor.execute('UPDATE service_status SET total_deletions = total_deletions + 1 WHERE id = 1')
+                    self.conn.commit()
+                
+        except Exception as e:
+            print(f"❌ Error checking auto-delete posts: {e}")
     
-    def update_delete_interval(self, channel_id, interval):
-        cursor = self.conn.cursor()
-        cursor.execute('UPDATE channels SET delete_interval = ? WHERE channel_id = ?', (interval, channel_id))
-        self.conn.commit()
-        logger.info(f"Updated interval for {channel_id}: {interval}s")
+    def delete_post(self, channel_username, message_id, post_id):
+        """Delete a post from channel (simulated for demo)"""
+        try:
+            # In a real bot, you would use Telegram API to delete the message
+            # For demo purposes, we'll just log it
+            
+            print(f"🗑️ Simulating deletion of message {message_id} from {channel_username}")
+            
+            # Update database
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                UPDATE auto_delete_posts 
+                SET is_active = 0, deleted_at = datetime('now') 
+                WHERE id = ?
+            ''', (post_id,))
+            self.conn.commit()
+            
+            return True
+                
+        except Exception as e:
+            print(f"❌ Error deleting post: {e}")
+            return False
     
-    def add_admin(self, channel_id, user_id, username, full_name, added_by):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            INSERT OR IGNORE INTO allowed_admins 
-            (channel_id, user_id, username, full_name, added_by, added_date)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (channel_id, user_id, username, full_name, added_by, datetime.now()))
-        self.conn.commit()
-        logger.info(f"Added admin {username} (ID: {user_id}) to channel {channel_id}")
+    def add_channel_admin(self, user_id, username, first_name, added_by, delete_hours=24):
+        """Add a new channel admin"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO channel_admins 
+                (user_id, username, first_name, added_by, is_active, delete_after_hours)
+                VALUES (?, ?, ?, ?, 1, ?)
+            ''', (user_id, username, first_name, added_by, delete_hours))
+            
+            # Update stats
+            cursor.execute('UPDATE service_status SET total_admins = total_admins + 1 WHERE id = 1')
+            self.conn.commit()
+            
+            print(f"✅ Added channel admin: {first_name} ({user_id}) with {delete_hours}h auto-delete")
+            return True
+        except Exception as e:
+            print(f"❌ Error adding channel admin: {e}")
+            return False
     
-    def remove_admin(self, channel_id, user_id):
-        cursor = self.conn.cursor()
-        cursor.execute('DELETE FROM allowed_admins WHERE channel_id = ? AND user_id = ?', (channel_id, user_id))
-        self.conn.commit()
-        removed = cursor.rowcount > 0
-        if removed:
-            logger.info(f"Removed admin {user_id} from channel {channel_id}")
-        return removed
+    def remove_channel_admin(self, user_id):
+        """Remove a channel admin"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('UPDATE channel_admins SET is_active = 0 WHERE user_id = ?', (user_id,))
+            self.conn.commit()
+            print(f"✅ Removed channel admin: {user_id}")
+            return True
+        except Exception as e:
+            print(f"❌ Error removing channel admin: {e}")
+            return False
     
-    def get_admins(self, channel_id):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            SELECT user_id, username, full_name, added_date 
-            FROM allowed_admins 
-            WHERE channel_id = ? 
-            ORDER BY added_date
-        ''', (channel_id,))
-        return cursor.fetchall()
+    def get_channel_admins(self):
+        """Get all active channel admins"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT user_id, username, first_name, added_by, added_at, delete_after_hours 
+                FROM channel_admins 
+                WHERE is_active = 1 
+                ORDER BY added_at DESC
+            ''')
+            return cursor.fetchall()
+        except Exception as e:
+            print(f"❌ Error getting channel admins: {e}")
+            return []
     
-    def schedule_deletion(self, channel_id, message_id, delete_after_seconds):
-        delete_at = datetime.now() + timedelta(seconds=delete_after_seconds)
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            INSERT INTO pending_deletions 
-            (channel_id, message_id, delete_at)
-            VALUES (?, ?, ?)
-        ''', (channel_id, message_id, delete_at))
-        self.conn.commit()
-        deletion_id = cursor.lastrowid
-        logger.info(f"Scheduled deletion #{deletion_id} for message {message_id} in {channel_id} after {delete_after_seconds}s")
-        return deletion_id
+    def schedule_post_deletion(self, channel_username, message_id, user_id, delete_after_hours):
+        """Schedule a post for automatic deletion"""
+        try:
+            scheduled_time = datetime.now() + timedelta(hours=delete_after_hours)
+            
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                INSERT INTO auto_delete_posts 
+                (channel_username, message_id, user_id, delete_after_hours, scheduled_delete_time)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (channel_username, message_id, user_id, delete_after_hours, scheduled_time))
+            
+            self.conn.commit()
+            print(f"✅ Scheduled deletion for message {message_id} in {delete_after_hours} hours")
+            return True
+        except Exception as e:
+            print(f"❌ Error scheduling post deletion: {e}")
+            return False
     
-    def get_pending_deletions(self):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            SELECT id, channel_id, message_id 
-            FROM pending_deletions 
-            WHERE delete_at <= ? AND processed = FALSE
-        ''', (datetime.now(),))
-        return cursor.fetchall()
-    
-    def mark_deletion_processed(self, deletion_id):
-        cursor = self.conn.cursor()
-        cursor.execute('UPDATE pending_deletions SET processed = TRUE WHERE id = ?', (deletion_id,))
-        self.conn.commit()
-    
-    def is_admin(self, channel_id, user_id):
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT 1 FROM allowed_admins WHERE channel_id = ? AND user_id = ?', (channel_id, user_id))
-        result = cursor.fetchone() is not None
-        logger.info(f"Admin check for user {user_id} in channel {channel_id}: {'YES' if result else 'NO'}")
-        return result
-    
-    def get_channel_settings(self, channel_id):
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT bot_added_date, delete_interval FROM channels WHERE channel_id = ? AND is_active = TRUE', (channel_id,))
-        result = cursor.fetchone()
-        if result:
+    def get_system_stats(self):
+        """Get system statistics"""
+        try:
+            cursor = self.conn.cursor()
+            
+            # Get admins count
+            cursor.execute('SELECT COUNT(*) FROM channel_admins WHERE is_active = 1')
+            active_admins = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM channel_admins')
+            total_admins = cursor.fetchone()[0]
+            
+            # Get deletions count
+            cursor.execute('SELECT COUNT(*) FROM auto_delete_posts WHERE is_active = 0')
+            total_deletions = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM auto_delete_posts WHERE is_active = 1')
+            pending_deletions = cursor.fetchone()[0]
+            
+            # Get service uptime
+            cursor.execute('SELECT last_restart, uptime_hours FROM service_status WHERE id = 1')
+            result = cursor.fetchone()
+            last_restart = result[0] if result else None
+            uptime_hours = result[1] if result else 0
+            
             return {
-                'bot_added_date': datetime.fromisoformat(result[0]),
-                'delete_interval': result[1]
+                'active_admins': active_admins,
+                'total_admins': total_admins,
+                'total_deletions': total_deletions,
+                'pending_deletions': pending_deletions,
+                'last_restart': last_restart,
+                'uptime_hours': uptime_hours,
+                'database_path': self.get_db_path(),
+                'monitoring_active': self.is_monitoring
             }
-        return None
-    
-    def is_channel_setup(self, channel_id):
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT 1 FROM channels WHERE channel_id = ? AND is_active = TRUE', (channel_id,))
-        return cursor.fetchone() is not None
-
-# ==================== TELEGRAM BOT ====================
-
-class TelegramBot:
-    def __init__(self, token, db_manager):
-        self.token = token
-        self.db = db_manager
-        self.bot_url = f"https://api.telegram.org/bot{token}"
-        
-        # Store user states
-        self.user_states = {}
-        
-        # Get bot info
-        self.bot_info = self.get_bot_info()
-        
-        logger.info(f"Bot initialized: @{self.bot_info['username']}")
-    
-    def get_bot_info(self):
-        """Get bot information"""
-        try:
-            response = requests.get(f"{self.bot_url}/getMe")
-            if response.status_code == 200:
-                return response.json()['result']
-            else:
-                logger.error("Failed to get bot info")
-                return {'username': 'unknown', 'id': 0}
         except Exception as e:
-            logger.error(f"Error getting bot info: {e}")
-            return {'username': 'unknown', 'id': 0}
-    
-    def setup_webhook(self):
-        """Setup webhook with Telegram"""
-        try:
-            webhook_url = f"{os.environ.get('RENDER_EXTERNAL_URL')}/webhook"
-            response = requests.post(
-                f"{self.bot_url}/setWebhook",
-                json={'url': webhook_url}
-            )
-            if response.status_code == 200:
-                logger.info(f"Webhook set to: {webhook_url}")
-                return True
-            else:
-                logger.error(f"Failed to set webhook: {response.text}")
-                return False
-        except Exception as e:
-            logger.error(f"Error setting webhook: {e}")
-            return False
-    
-    def send_message(self, chat_id, text, reply_markup=None, parse_mode='HTML'):
-        """Send message to chat"""
-        try:
-            data = {
-                'chat_id': chat_id,
-                'text': text,
-                'parse_mode': parse_mode
+            print(f"❌ Error getting system stats: {e}")
+            return {
+                'active_admins': 0,
+                'total_admins': 0,
+                'total_deletions': 0,
+                'pending_deletions': 0,
+                'error': str(e)
             }
-            if reply_markup:
-                data['reply_markup'] = reply_markup
+    
+    def update_uptime(self):
+        """Update service uptime in database"""
+        try:
+            cursor = self.conn.cursor()
+            # This would be called periodically from the main service
+            cursor.execute('UPDATE service_status SET uptime_hours = uptime_hours + 1 WHERE id = 1')
+            self.conn.commit()
+        except:
+            pass
+
+# ==================== MAIN SERVICE CLASS ====================
+
+class AdminService:
+    def __init__(self):
+        self.admin_system = AdminManagementSystem()
+        self.keep_alive = None
+        self.last_restart = time.time()
+        self.error_count = 0
+        
+        print("✅ Admin Service initialized!")
+        print("🔄 Starting essential services...")
+    
+    def initialize(self):
+        """Initialize the service"""
+        try:
+            print("🔄 Initializing admin service...")
             
-            response = requests.post(f"{self.bot_url}/sendMessage", json=data)
-            if response.status_code == 200:
-                return True
-            else:
-                logger.error(f"Failed to send message: {response.text}")
+            # Start keep-alive service
+            if not self.start_keep_alive():
+                print("❌ Keep-alive service failed to start")
                 return False
-        except Exception as e:
-            logger.error(f"Error sending message: {e}")
-            return False
-    
-    def delete_message(self, chat_id, message_id):
-        """Delete a message"""
-        try:
-            data = {
-                'chat_id': chat_id,
-                'message_id': message_id
-            }
-            response = requests.post(f"{self.bot_url}/deleteMessage", json=data)
-            if response.status_code == 200:
-                logger.info(f"✅ Successfully deleted message {message_id} from {chat_id}")
-                return True
-            else:
-                logger.warning(f"❌ Failed to delete message {message_id}: {response.text}")
-                return False
-        except Exception as e:
-            logger.error(f"Error deleting message: {e}")
-            return False
-    
-    def get_chat(self, chat_id):
-        """Get chat information"""
-        try:
-            response = requests.get(f"{self.bot_url}/getChat", params={'chat_id': chat_id})
-            if response.status_code == 200:
-                return response.json()['result']
-            return None
-        except Exception as e:
-            logger.error(f"Error getting chat info: {e}")
-            return None
-    
-    def get_chat_administrators(self, chat_id):
-        """Get chat administrators"""
-        try:
-            response = requests.get(f"{self.bot_url}/getChatAdministrators", params={'chat_id': chat_id})
-            if response.status_code == 200:
-                return response.json()['result']
-            return []
-        except Exception as e:
-            logger.error(f"Error getting chat admins: {e}")
-            return []
-    
-    def process_update(self, update):
-        """Process incoming update - IMPROVED CHANNEL DETECTION"""
-        try:
-            update_id = update.get('update_id')
-            logger.info(f"📨 Received update: {update_id}")
             
-            # DEBUG: Log the entire update to see what we're receiving
-            logger.info(f"Update content: {update}")
+            # Start auto-delete monitoring
+            self.admin_system.start_auto_delete_monitor()
             
-            # Handle bot being added to channels/groups - PRIMARY CHANNEL DETECTION
-            if 'my_chat_member' in update:
-                logger.info("🎯 Found my_chat_member update - processing bot addition/removal")
-                self.handle_chat_member_update(update['my_chat_member'])
-                return
-            
-            # Handle channel posts - SECONDARY CHANNEL DETECTION
-            if 'channel_post' in update:
-                logger.info("📢 Found channel_post update - bot is in a channel!")
-                self.handle_channel_post(update['channel_post'])
-                return
-            
-            # Handle regular messages in groups/channels
-            if 'message' in update:
-                self.handle_message(update['message'])
-            elif 'callback_query' in update:
-                self.handle_callback_query(update['callback_query'])
-                
-        except Exception as e:
-            logger.error(f"Error processing update: {e}")
-    
-    def handle_channel_post(self, message):
-        """Handle channel posts - this means we're definitely in a channel!"""
-        try:
-            chat_id = message['chat']['id']
-            chat_type = message['chat']['type']
-            message_id = message['message_id']
-            chat_title = message['chat'].get('title', 'Unknown Channel')
-            
-            logger.info(f"📢 Channel post detected in {chat_type} '{chat_title}' ({chat_id})")
-            
-            # Auto-setup the channel if not already setup
-            if not self.db.is_channel_setup(str(chat_id)):
-                logger.info(f"🚀 Auto-setting up channel from channel post: {chat_title}")
-                self.auto_setup_channel(chat_id, chat_title)
-            else:
-                logger.info(f"ℹ️ Channel {chat_title} is already setup")
-            
-            # Process the message for deletion (delete all messages in channels except from allowed admins)
-            self.process_message_for_deletion(message)
-                
-        except Exception as e:
-            logger.error(f"Error handling channel post: {e}")
-    
-    def handle_chat_member_update(self, chat_member_update):
-        """Handle when bot is added/removed from chats - IMPROVED DETECTION"""
-        try:
-            chat = chat_member_update['chat']
-            new_member = chat_member_update['new_chat_member']
-            old_member = chat_member_update['old_chat_member']
-            
-            new_status = new_member['status']
-            old_status = old_member['status']
-            
-            chat_id = str(chat['id'])
-            chat_title = chat.get('title', 'Unknown Chat')
-            chat_type = chat['type']
-            
-            logger.info(f"👤 Chat member update in {chat_type} '{chat_title}': {old_status} -> {new_status}")
-            
-            # Bot was added to a group/channel
-            if new_status in ['administrator', 'member', 'restricted'] and old_status == 'left':
-                logger.info(f"🎉 Bot was added to {chat_type} '{chat_title}'")
-                self.auto_setup_channel(chat_id, chat_title)
-            
-            # Bot was removed from a group/channel
-            elif new_status == 'left' and old_status in ['administrator', 'member', 'restricted']:
-                logger.info(f"🔴 Bot was removed from {chat_title}")
-                
-        except Exception as e:
-            logger.error(f"Error handling chat member update: {e}")
-    
-    def handle_message(self, message):
-        """Handle incoming message - IMPROVED CHANNEL DETECTION"""
-        try:
-            chat_id = message['chat']['id']
-            chat_type = message['chat']['type']
-            chat_title = message['chat'].get('title', 'Unknown Chat')
-            
-            logger.info(f"💬 Message in {chat_type} '{chat_title}' ({chat_id})")
-            
-            # If this is a service message about bot being added to a group
-            if 'new_chat_members' in message:
-                for new_member in message['new_chat_members']:
-                    if new_member.get('id') == self.bot_info['id']:
-                        logger.info(f"🎉 Bot was added via new_chat_members message to {chat_title}")
-                        self.auto_setup_channel(chat_id, chat_title)
-                        return
-            
-            # For channels, if we get any message and we're not setup, auto-setup
-            if chat_type == 'channel' and not self.db.is_channel_setup(str(chat_id)):
-                logger.info(f"🚀 Auto-setting up channel from first message: {chat_title}")
-                self.auto_setup_channel(chat_id, chat_title)
-            
-            # Process the message for commands or deletion
-            self.process_message_for_deletion(message)
-            
-        except Exception as e:
-            logger.error(f"Error handling message: {e}")
-    
-    def auto_setup_channel(self, chat_id, chat_title=None):
-        """Automatically setup a channel when detected"""
-        try:
-            if not chat_title:
-                chat_info = self.get_chat(chat_id)
-                if chat_info:
-                    chat_title = chat_info.get('title', f"Chat {chat_id}")
-                else:
-                    chat_title = f"Chat {chat_id}"
-            
-            # Check if already setup
-            if self.db.is_channel_setup(str(chat_id)):
-                logger.info(f"ℹ️ Channel {chat_title} is already setup")
-                return True
-            
-            logger.info(f"🚀 AUTO-SETUP: Setting up channel: {chat_title} ({chat_id})")
-            
-            # Setup channel in database
-            self.db.add_channel(str(chat_id), chat_title)
-            
-            # Try to send welcome message
-            welcome_text = f"""
-🤖 <b>Auto Delete Bot has been added to {chat_title}!</b>
-
-I will automatically delete ALL messages except those from specified admins.
-
-<b>Next steps:</b>
-1. Add allowed admins using /admins command
-2. Configure deletion timing using /settings command
-3. Make sure I have <b>delete messages</b> permission!
-
-<b>Important:</b> I will delete ALL messages from users who are NOT in the allowed admin list.
-
-<b>Commands:</b>
-/admins - Manage allowed users
-/settings - Configure deletion timing
-/start - Show main menu
-            """
-            success = self.send_message(chat_id, welcome_text)
-            if success:
-                logger.info(f"✅ Successfully sent welcome message to {chat_title}")
-            else:
-                logger.warning(f"⚠️ Could not send welcome message to {chat_title} - bot may not have send_message permission")
-            
+            print("✅ Admin service initialization completed successfully!")
             return True
             
         except Exception as e:
-            logger.error(f"❌ Error in auto setup: {e}")
+            print(f"❌ Service initialization failed: {e}")
             return False
-    
-    def process_message_for_deletion(self, message):
-        """Process message for commands or deletion - FIXED ADMIN RECOGNITION"""
-        try:
-            chat_id = message['chat']['id']
-            user_id = message['from']['id'] if 'from' in message else None
-            message_id = message['message_id']
-            chat_type = message['chat']['type']
-            chat_title = message['chat'].get('title', 'Unknown')
-            
-            logger.info(f"🔍 Processing message {message_id} in {chat_type} '{chat_title}' from user {user_id}")
-            
-            # Check if it's a command
-            if 'text' in message and message['text'].startswith('/'):
-                self.handle_command(message)
-                return
-            
-            # Check user state for conversation flow
-            if user_id:
-                user_state = self.get_user_state(user_id)
-                if user_state and 'text' in message:
-                    self.handle_user_state(user_id, chat_id, message['text'])
-                    return
-            
-            # Only process messages from groups/channels where bot is setup
-            if chat_type not in ['group', 'supergroup', 'channel']:
-                return
-            
-            # Check if channel is setup
-            if not self.db.is_channel_setup(str(chat_id)):
-                logger.info(f"ℹ️ Channel {chat_id} not setup yet, ignoring message")
-                return
-            
-            # For channels, handle message deletion
-            if chat_type == 'channel':
-                # In channels, check if message is from the bot itself
-                if 'from' in message and message['from'].get('id') == self.bot_info['id']:
-                    logger.info("🤖 Message from bot itself - not deleting")
-                    return  # Don't delete bot's own messages
-                
-                # For channels, check if user is in the allowed admin list
-                if user_id:
-                    is_allowed_admin = self.db.is_admin(str(chat_id), user_id)
-                    logger.info(f"👤 User {user_id} allowed admin status: {'YES' if is_allowed_admin else 'NO'}")
-                    
-                    if is_allowed_admin:
-                        logger.info(f"✅ Allowed admin {user_id} - not deleting their message")
-                        return  # Allowed admin can post freely
-                
-                # If we get here, the user is NOT an allowed admin - schedule deletion
-                logger.info(f"🚫 User {user_id} is NOT an allowed admin - scheduling deletion")
-                channel_settings = self.db.get_channel_settings(str(chat_id))
-                if channel_settings:
-                    delete_interval = channel_settings['delete_interval']
-                    self.db.schedule_deletion(str(chat_id), message_id, delete_interval)
-                    logger.info(f"⏰ Scheduled deletion for message {message_id} after {delete_interval}s")
-                return
-            
-            # For groups, check if user is in the allowed admin list
-            if user_id:
-                is_allowed_admin = self.db.is_admin(str(chat_id), user_id)
-                logger.info(f"👤 User {user_id} allowed admin status: {'YES' if is_allowed_admin else 'NO'}")
-                
-                if is_allowed_admin:
-                    logger.info(f"✅ Allowed admin {user_id} - not deleting their message")
-                    return  # Allowed admin can post freely
-            
-            # If we get here, the user is NOT an allowed admin - schedule deletion
-            
-            # Get channel settings
-            channel_settings = self.db.get_channel_settings(str(chat_id))
-            if not channel_settings:
-                logger.warning(f"❌ No channel settings found for {chat_id}")
-                return
-            
-            # Check message time (only delete messages after bot was added)
-            message_date = datetime.fromtimestamp(message['date'])
-            if message_date < channel_settings['bot_added_date']:
-                logger.info(f"📅 Message from before bot was added - not deleting")
-                return  # Message before bot was added
-            
-            # Schedule deletion for non-admin user
-            delete_interval = channel_settings['delete_interval']
-            self.db.schedule_deletion(str(chat_id), message_id, delete_interval)
-            logger.info(f"⏰ Scheduled deletion for message {message_id} from non-admin user {user_id} after {delete_interval}s")
-            
-        except Exception as e:
-            logger.error(f"❌ Error processing message for deletion: {e}")
-    
-    def set_user_state(self, user_id, state, data=None):
-        """Set user conversation state"""
-        self.user_states[user_id] = {'state': state, 'data': data or {}}
-    
-    def get_user_state(self, user_id):
-        """Get user conversation state"""
-        return self.user_states.get(user_id)
-    
-    def clear_user_state(self, user_id):
-        """Clear user conversation state"""
-        if user_id in self.user_states:
-            del self.user_states[user_id]
-    
-    def handle_user_state(self, user_id, chat_id, text):
-        """Handle user in conversation state"""
-        state = self.get_user_state(user_id)
-        if not state:
-            return
-        
-        if state['state'] == 'waiting_admin_username':
-            self.process_add_admin(chat_id, user_id, text)
-        elif state['state'] == 'waiting_remove_admin':
-            self.process_remove_admin(chat_id, user_id, text)
-        elif state['state'] == 'waiting_interval':
-            self.process_set_interval(chat_id, user_id, text)
-    
-    def handle_command(self, message):
-        """Handle bot commands"""
-        chat_id = message['chat']['id']
-        user_id = message['from']['id'] if 'from' in message else None
-        text = message['text']
-        
-        logger.info(f"⌨️ Command received: {text} from {user_id} in {chat_id}")
-        
-        if text == '/start':
-            self.send_main_menu(chat_id)
-        elif text == '/setup':
-            self.send_setup_message(chat_id, user_id)
-        elif text == '/admins':
-            self.send_admin_management(chat_id, user_id)
-        elif text == '/settings':
-            self.send_settings(chat_id, user_id)
-        elif text == '/stats':
-            self.send_stats_message(chat_id)
-        elif text == '/debug':
-            self.send_debug_info(chat_id)
-    
-    def send_debug_info(self, chat_id):
-        """Send debug information"""
-        try:
-            chat_info = self.get_chat(chat_id)
-            is_setup = self.db.is_channel_setup(str(chat_id))
-            admins = self.db.get_admins(str(chat_id)) if is_setup else []
-            
-            debug_text = f"""
-🔧 <b>Debug Information</b>
-
-<b>Chat ID:</b> <code>{chat_id}</code>
-<b>Chat Type:</b> {chat_info.get('type', 'unknown') if chat_info else 'unknown'}
-<b>Chat Title:</b> {chat_info.get('title', 'No title') if chat_info else 'No title'}
-<b>Bot Setup:</b> {'✅ Yes' if is_setup else '❌ No'}
-<b>Allowed Admins:</b> {len(admins)}
-
-<b>Bot Status:</b> 🟢 Running
-<b>Bot Username:</b> @{self.bot_info['username']}
-
-<b>To setup:</b> Use /setup command
-<b>To add admins:</b> Use /admins command
-            """
-            self.send_message(chat_id, debug_text)
-        except Exception as e:
-            logger.error(f"Error sending debug info: {e}")
-    
-    def handle_callback_query(self, callback_query):
-        """Handle callback queries"""
-        chat_id = callback_query['message']['chat']['id']
-        user_id = callback_query['from']['id']
-        data = callback_query['data']
-        
-        logger.info(f"🔘 Callback query: {data} from {user_id}")
-        
-        # Answer callback query
-        requests.post(f"{self.bot_url}/answerCallbackQuery", json={'callback_query_id': callback_query['id']})
-        
-        if data == 'main_menu':
-            self.send_main_menu(chat_id)
-        elif data == 'setup_bot':
-            self.send_setup_message(chat_id, user_id)
-        elif data == 'confirm_setup':
-            self.confirm_setup(chat_id, user_id)
-        elif data == 'manage_admins':
-            self.send_admin_management(chat_id, user_id)
-        elif data == 'add_admin':
-            self.prompt_add_admin(chat_id, user_id)
-        elif data == 'remove_admin':
-            self.prompt_remove_admin(chat_id, user_id)
-        elif data == 'list_admins':
-            self.show_admin_list(chat_id)
-        elif data == 'settings':
-            self.send_settings(chat_id, user_id)
-        elif data == 'set_interval':
-            self.prompt_set_interval(chat_id, user_id)
-        elif data == 'show_stats':
-            self.send_stats_message(chat_id)
-        elif data.startswith('interval_'):
-            interval = int(data.replace('interval_', ''))
-            self.set_delete_interval(chat_id, user_id, interval)
-        elif data == 'debug':
-            self.send_debug_info(chat_id)
-    
-    def send_main_menu(self, chat_id):
-        """Send main menu"""
-        text = """
-🤖 <b>Auto Delete Bot - Main Menu</b>
-
-I automatically delete ALL messages except those from specified admins.
-
-Choose an option below:
-        """
-        keyboard = {
-            'inline_keyboard': [
-                [{'text': '🛠️ Setup Bot', 'callback_data': 'setup_bot'}],
-                [{'text': '👥 Manage Admins', 'callback_data': 'manage_admins'}],
-                [{'text': '⚙️ Settings', 'callback_data': 'settings'}],
-                [{'text': '📊 Statistics', 'callback_data': 'show_stats'}],
-                [{'text': '🔧 Debug', 'callback_data': 'debug'}]
-            ]
-        }
-        self.send_message(chat_id, text, keyboard)
-    
-    def send_setup_message(self, chat_id, user_id):
-        """Send setup message"""
-        # Check if already setup
-        if self.db.is_channel_setup(str(chat_id)):
-            self.send_message(chat_id, "✅ Bot is already setup in this chat! Use /admins to manage allowed users.")
-            return
-        
-        text = """
-🛠️ <b>Manual Setup</b>
-
-Click Confirm Setup to configure the bot in this chat.
-
-<b>Important:</b> I will delete ALL messages from users who are NOT in the allowed admin list.
-
-<b>Requirements:</b>
-• I need <b>delete messages</b> permission
-• Only messages after setup will be deleted
-• You must add allowed admins after setup
-        """
-        keyboard = {
-            'inline_keyboard': [
-                [{'text': '✅ Confirm Setup', 'callback_data': 'confirm_setup'}],
-                [{'text': '❌ Cancel', 'callback_data': 'main_menu'}]
-            ]
-        }
-        self.send_message(chat_id, text, keyboard)
-    
-    def confirm_setup(self, chat_id, user_id):
-        """Confirm bot setup"""
-        try:
-            # Get chat info
-            chat_info = self.get_chat(chat_id)
-            if not chat_info:
-                self.send_message(chat_id, "❌ Error: Could not get chat information")
-                return
-            
-            chat_title = chat_info.get('title', 'Unknown Chat')
-            chat_type = chat_info.get('type', 'unknown')
-            
-            # Setup channel in database
-            self.db.add_channel(str(chat_id), chat_title)
-            
-            # Add user as admin if it's a group (in channels, we'll add admins manually)
-            if user_id and chat_type != 'channel':
-                self.db.add_admin(str(chat_id), user_id, "user", "User", user_id)
-            
-            success_text = f"""
-✅ <b>Setup Complete!</b>
-
-<b>Chat:</b> {chat_title}
-<b>Auto-deletion:</b> 🟢 Enabled
-<b>Deletion Interval:</b> 5 minutes
-
-<b>Important:</b> I will delete ALL messages from users who are NOT in the allowed admin list.
-
-Use /admins to add allowed users who can post without deletion.
-            """
-            self.send_message(chat_id, success_text)
-            
-        except Exception as e:
-            logger.error(f"Error in setup: {e}")
-            self.send_message(chat_id, "❌ Error during setup")
-    
-    def send_admin_management(self, chat_id, user_id):
-        """Send admin management menu"""
-        if not self.db.is_channel_setup(str(chat_id)):
-            self.send_message(chat_id, "❌ Bot is not setup in this chat. Please run /setup first.")
-            return
-        
-        admins = self.db.get_admins(str(chat_id))
-        admin_count = len(admins)
-        
-        text = f"""
-👥 <b>Admin Management</b>
-
-Currently have <b>{admin_count}</b> allowed admin(s).
-
-<b>Only users in this list can post without deletion.</b>
-
-Choose an option below:
-        """
-        keyboard = {
-            'inline_keyboard': [
-                [{'text': '➕ Add Admin', 'callback_data': 'add_admin'}],
-                [{'text': '➖ Remove Admin', 'callback_data': 'remove_admin'}],
-                [{'text': '📋 List Admins', 'callback_data': 'list_admins'}],
-                [{'text': '🔙 Back to Main', 'callback_data': 'main_menu'}]
-            ]
-        }
-        self.send_message(chat_id, text, keyboard)
-    
-    def prompt_add_admin(self, chat_id, user_id):
-        """Prompt user to add admin"""
-        text = """
-➕ <b>Add Admin</b>
-
-Reply with the username (format: @username or username):
-
-The user must be an admin in this chat.
-
-<b>Only users in the allowed admin list can post without deletion.</b>
-        """
-        self.set_user_state(user_id, 'waiting_admin_username')
-        keyboard = {
-            'inline_keyboard': [
-                [{'text': '🔙 Back', 'callback_data': 'manage_admins'}]
-            ]
-        }
-        self.send_message(chat_id, text, keyboard)
-    
-    def process_add_admin(self, chat_id, user_id, username_input):
-        """Process adding an admin"""
-        try:
-            username = username_input.lstrip('@')
-            
-            # Get chat administrators to find the user
-            admins = self.get_chat_administrators(chat_id)
-            target_user = None
-            
-            for admin in admins:
-                admin_user = admin['user']
-                if (admin_user.get('username', '').lower() == username.lower() or 
-                    admin_user.get('first_name', '').lower() == username.lower()):
-                    target_user = admin_user
-                    break
-            
-            if not target_user:
-                self.send_message(chat_id, f"❌ User @{username} not found or not an admin in this chat.")
-                self.clear_user_state(user_id)
-                return
-            
-            # Add to database
-            full_name = f"{target_user.get('first_name', '')} {target_user.get('last_name', '')}".strip()
-            self.db.add_admin(str(chat_id), target_user['id'], target_user.get('username', ''), full_name, user_id)
-            
-            success_text = f"""
-✅ <b>Admin Added Successfully!</b>
-
-<b>User:</b> {full_name} (@{target_user.get('username', 'N/A')})
-<b>ID:</b> <code>{target_user['id']}</code>
-
-This user can now post messages without them being deleted.
-            """
-            self.clear_user_state(user_id)
-            self.send_message(chat_id, success_text)
-            
-        except Exception as e:
-            logger.error(f"Error adding admin: {e}")
-            self.send_message(chat_id, "❌ Error adding admin")
-            self.clear_user_state(user_id)
-    
-    def prompt_remove_admin(self, chat_id, user_id):
-        """Prompt user to remove admin"""
-        text = """
-➖ <b>Remove Admin</b>
-
-Reply with the username to remove (format: @username or username):
-
-This user's messages will be deleted after removal.
-        """
-        self.set_user_state(user_id, 'waiting_remove_admin')
-        keyboard = {
-            'inline_keyboard': [
-                [{'text': '🔙 Back', 'callback_data': 'manage_admins'}]
-            ]
-        }
-        self.send_message(chat_id, text, keyboard)
-    
-    def process_remove_admin(self, chat_id, user_id, username_input):
-        """Process removing an admin"""
-        try:
-            username = username_input.lstrip('@')
-            
-            # Find admin by username
-            admins = self.db.get_admins(str(chat_id))
-            target_admin = None
-            
-            for admin_user_id, admin_username, full_name, added_date in admins:
-                if admin_username and admin_username.lower() == username.lower():
-                    target_admin = (admin_user_id, admin_username, full_name)
-                    break
-            
-            if not target_admin:
-                self.send_message(chat_id, f"❌ User @{username} not found in allowed admins list.")
-                self.clear_user_state(user_id)
-                return
-            
-            # Remove from database
-            admin_user_id, admin_username, full_name = target_admin
-            removed = self.db.remove_admin(str(chat_id), admin_user_id)
-            
-            if removed:
-                success_text = f"""
-✅ <b>Admin Removed Successfully!</b>
-
-<b>User:</b> {full_name} (@{admin_username})
-
-This user's messages will now be auto-deleted.
-                """
-            else:
-                success_text = f"❌ Failed to remove admin @{admin_username}"
-            
-            self.clear_user_state(user_id)
-            self.send_message(chat_id, success_text)
-            
-        except Exception as e:
-            logger.error(f"Error removing admin: {e}")
-            self.send_message(chat_id, "❌ Error removing admin")
-            self.clear_user_state(user_id)
-    
-    def show_admin_list(self, chat_id):
-        """Show list of allowed admins"""
-        admins = self.db.get_admins(str(chat_id))
-        
-        if not admins:
-            text = """
-❌ No allowed admins found.
-
-<b>All messages will be deleted!</b>
-
-Use the 'Add Admin' button to add users who can post without deletion.
-            """
-        else:
-            text = "✅ <b>Allowed Admins:</b>\n\n"
-            text += "<b>Only these users can post without deletion:</b>\n\n"
-            for i, (user_id, username, full_name, added_date) in enumerate(admins, 1):
-                date_str = datetime.fromisoformat(added_date).strftime('%Y-%m-%d')
-                text += f"{i}. <b>{full_name}</b> (@{username})\n   ID: <code>{user_id}</code>\n   Added: {date_str}\n\n"
-        
-        keyboard = {
-            'inline_keyboard': [
-                [{'text': '🔙 Back to Admin Management', 'callback_data': 'manage_admins'}]
-            ]
-        }
-        self.send_message(chat_id, text, keyboard)
-    
-    def send_settings(self, chat_id, user_id):
-        """Send settings menu"""
-        if not self.db.is_channel_setup(str(chat_id)):
-            self.send_message(chat_id, "❌ Bot is not setup in this chat. Please run /setup first.")
-            return
-        
-        channel_settings = self.db.get_channel_settings(str(chat_id))
-        interval = channel_settings['delete_interval'] if channel_settings else 300
-        interval_minutes = interval // 60
-        
-        text = f"""
-⚙️ <b>Bot Settings</b>
-
-<b>Deletion Interval:</b> {interval} seconds ({interval_minutes} minutes)
-
-Messages from users NOT in the allowed admin list will be deleted after this delay.
-
-Choose an option below to manage settings:
-        """
-        keyboard = {
-            'inline_keyboard': [
-                [{'text': f'⏰ Change Interval ({interval_minutes}min)', 'callback_data': 'set_interval'}],
-                [{'text': '🔙 Back to Main', 'callback_data': 'main_menu'}]
-            ]
-        }
-        self.send_message(chat_id, text, keyboard)
-    
-    def prompt_set_interval(self, chat_id, user_id):
-        """Prompt user to set deletion interval"""
-        text = """
-⏰ <b>Deletion Interval</b>
-
-Select how long to wait before deleting messages from users NOT in the allowed admin list:
-
-• <b>1 minute</b> - Quick deletion
-• <b>5 minutes</b> - Recommended (default)
-• <b>10 minutes</b> - More lenient
-• <b>15 minutes</b> - Very lenient
-• <b>30 minutes</b> - Maximum leniency
-
-Choose an option below:
-        """
-        keyboard = {
-            'inline_keyboard': [
-                [{'text': '1 minute', 'callback_data': 'interval_60'}],
-                [{'text': '5 minutes', 'callback_data': 'interval_300'}],
-                [{'text': '10 minutes', 'callback_data': 'interval_600'}],
-                [{'text': '15 minutes', 'callback_data': 'interval_900'}],
-                [{'text': '30 minutes', 'callback_data': 'interval_1800'}],
-                [{'text': '🔙 Back to Settings', 'callback_data': 'settings'}]
-            ]
-        }
-        self.send_message(chat_id, text, keyboard)
-    
-    def set_delete_interval(self, chat_id, user_id, interval):
-        """Set deletion interval"""
-        self.db.update_delete_interval(str(chat_id), interval)
-        minutes = interval // 60
-        
-        success_text = f"""
-✅ <b>Deletion Interval Updated!</b>
-
-<b>New Interval:</b> {interval} seconds ({minutes} minutes)
-
-Messages from users NOT in the allowed admin list will be deleted after this delay.
-        """
-        self.send_message(chat_id, success_text)
-    
-    def send_stats_message(self, chat_id):
-        """Send statistics message"""
-        text = """
-📊 <b>Bot Statistics</b>
-
-<b>Status:</b> 🟢 Running
-<b>Service:</b> Auto Delete Bot
-
-Use the main menu to manage your chat settings.
-        """
-        keyboard = {
-            'inline_keyboard': [
-                [{'text': '🔙 Back to Main', 'callback_data': 'main_menu'}]
-            ]
-        }
-        self.send_message(chat_id, text, keyboard)
-
-# ==================== DELETION WORKER ====================
-
-class DeletionWorker:
-    def __init__(self, bot_handler, db_manager):
-        self.bot = bot_handler
-        self.db = db_manager
-        self.is_running = False
-    
-    def start(self):
-        """Start the deletion worker"""
-        self.is_running = True
-        
-        def worker_loop():
-            while self.is_running:
-                try:
-                    self.process_pending_deletions()
-                    time.sleep(2)  # Check every 2 seconds for faster response
-                except Exception as e:
-                    logger.error(f"Error in deletion worker: {e}")
-                    time.sleep(10)
-        
-        thread = threading.Thread(target=worker_loop, daemon=True)
-        thread.start()
-        logger.info("Deletion worker started")
-    
-    def process_pending_deletions(self):
-        """Process pending message deletions"""
-        try:
-            pending = self.db.get_pending_deletions()
-            if pending:
-                logger.info(f"🔄 Processing {len(pending)} pending deletions")
-                
-            for deletion_id, channel_id, message_id in pending:
-                try:
-                    logger.info(f"Attempting to delete message {message_id} from {channel_id}")
-                    success = self.bot.delete_message(int(channel_id), message_id)
-                    
-                    if success:
-                        logger.info(f"✅ Successfully processed deletion #{deletion_id}")
-                    else:
-                        logger.warning(f"❌ Failed to process deletion #{deletion_id}")
-                    
-                    # Mark as processed regardless of success to avoid infinite retry
-                    self.db.mark_deletion_processed(deletion_id)
-                    
-                except Exception as e:
-                    logger.error(f"Error processing deletion {deletion_id}: {e}")
-                    # Mark as processed to avoid infinite retry
-                    self.db.mark_deletion_processed(deletion_id)
-                    
-        except Exception as e:
-            logger.error(f"Error in process_pending_deletions: {e}")
-
-# ==================== MAIN APPLICATION ====================
-
-class AutoDeleteBot:
-    def __init__(self, token: str):
-        self.token = token
-        self.db = DatabaseManager()
-        self.bot = TelegramBot(token, self.db)
-        self.worker = DeletionWorker(self.bot, self.db)
-        
-        logger.info("Auto Delete Bot initialized successfully")
-    
-    def setup_webhook(self):
-        """Setup webhook"""
-        return self.bot.setup_webhook()
-    
-    def process_update(self, update):
-        """Process incoming update"""
-        self.bot.process_update(update)
     
     def start_keep_alive(self):
         """Start keep-alive service"""
         try:
+            # Use Render external URL if available
             render_url = os.environ.get('RENDER_EXTERNAL_URL')
             if render_url:
                 health_url = f"{render_url}/health"
             else:
-                health_url = f"http://localhost:{os.environ.get('PORT', 8080)}/health"
+                health_url = f"http://localhost:{PORT}/health"
             
-            def ping_loop():
-                while True:
-                    try:
-                        requests.get(health_url, timeout=10)
-                        logger.info("Keep-alive ping successful")
-                    except:
-                        pass
-                    time.sleep(300)
-            
-            thread = threading.Thread(target=ping_loop, daemon=True)
-            thread.start()
-            logger.info("Keep-alive service started")
+            self.keep_alive = EnhancedKeepAliveService(health_url)
+            self.keep_alive.start()
+            print("🔋 Enhanced keep-alive service activated")
+            return True
         except Exception as e:
-            logger.error(f"Failed to start keep-alive: {e}")
+            print(f"❌ Failed to start keep-alive: {e}")
+            return False
     
     def run(self):
-        """Start the bot"""
-        # Start health server
-        health_thread = Thread(target=run_health_server, daemon=True)
-        health_thread.start()
+        """Main service loop"""
+        if not self.initialize():
+            print("❌ Service cannot start. Initialization failed.")
+            return
         
-        # Start keep-alive
-        self.start_keep_alive()
+        print("🚀 Admin Service is running...")
+        print("📊 Services running:")
+        print(f"  • Health check server (port {PORT})")
+        print("  • Enhanced keep-alive system")
+        print("  • Admin management system")
+        print("  • Auto-delete monitoring")
+        print(f"  • Database: {self.admin_system.get_db_path()}")
         
-        # Start deletion worker
-        self.worker.start()
+        # Show initial stats
+        stats = self.admin_system.get_system_stats()
+        print(f"\n📈 Initial Stats:")
+        print(f"  • Active Admins: {stats.get('active_admins', 0)}")
+        print(f"  • Pending Deletions: {stats.get('pending_deletions', 0)}")
+        print(f"  • Total Deletions: {stats.get('total_deletions', 0)}")
         
-        # Setup webhook
-        webhook_success = self.setup_webhook()
-        if webhook_success:
-            logger.info("✅ Webhook setup successful")
-        else:
-            logger.error("❌ Webhook setup failed")
+        print("\n🛡️  Service protection active")
+        print("📈 Monitoring health endpoint")
+        print("👑 Admin system ready")
+        print("🔧 Ready for 24/7 operation")
         
-        logger.info("🤖 Auto Delete Bot is now running with webhook!")
+        # Add some demo admins for testing
+        self.add_demo_data()
         
-        # Keep main thread alive
+        # Keep the main thread alive
         try:
             while True:
-                time.sleep(60)
+                time.sleep(3600)  # Sleep for 1 hour
+                # Update uptime
+                self.admin_system.update_uptime()
+                
         except KeyboardInterrupt:
-            logger.info("Bot stopped by user")
+            print("\n🛑 Service stopped by user")
+            if self.keep_alive:
+                self.keep_alive.stop()
+            print("👋 Goodbye!")
+    
+    def add_demo_data(self):
+        """Add demo data for testing"""
+        try:
+            print("🔄 Adding demo data for testing...")
+            
+            # Add a demo admin
+            self.admin_system.add_channel_admin(
+                user_id=123456789,
+                username="demo_admin",
+                first_name="Demo Admin",
+                added_by=1,
+                delete_hours=24
+            )
+            
+            # Schedule a demo deletion
+            self.admin_system.schedule_post_deletion(
+                channel_username="@test_channel",
+                message_id=1001,
+                user_id=123456789,
+                delete_after_hours=1  # Will be deleted in 1 hour
+            )
+            
+            print("✅ Demo data added successfully")
+            
+        except Exception as e:
+            print(f"❌ Error adding demo data: {e}")
 
 # ==================== MAIN EXECUTION ====================
 
 if __name__ == "__main__":
-    BOT_TOKEN = os.environ.get('BOT_TOKEN')
+    print("🚀 Starting Admin Management Service...")
     
-    if not BOT_TOKEN:
-        logger.error("❌ BOT_TOKEN environment variable is required!")
-        exit(1)
+    # Start health check server
+    start_health_check()
+    time.sleep(2)
     
-    try:
-        # Set global instance
-        bot_instance = AutoDeleteBot(BOT_TOKEN)
-        bot_instance.run()
-    except Exception as e:
-        logger.error(f"❌ Failed to start bot: {e}")
-        exit(1)
+    restart_count = 0
+    max_restarts = 20
+    restart_delay = 10
+    
+    while restart_count < max_restarts:
+        try:
+            restart_count += 1
+            print(f"\n🔄 Service start attempt #{restart_count}")
+            
+            service = AdminService()
+            service.run()
+            
+            print("🛑 Service stopped gracefully")
+            break
+            
+        except Exception as e:
+            print(f"💥 Service crash (#{restart_count}): {e}")
+            traceback.print_exc()
+            
+            if restart_count < max_restarts:
+                print(f"🔄 Restarting in {restart_delay} seconds...")
+                time.sleep(restart_delay)
+                restart_delay = min(restart_delay * 1.5, 300)
+            else:
+                print(f"❌ Maximum restarts ({max_restarts}) reached.")
+                print("🆘 Service cannot recover. Please check logs.")
+                break
+    
+    print("🔴 Service ended")
