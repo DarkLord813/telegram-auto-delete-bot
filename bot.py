@@ -247,6 +247,9 @@ class TelegramProtectionBot:
         self.bot_username = None
         self.channel_cache = {}
         
+        # User states for tracking input
+        self.user_states = {}  # user_id -> {'state': 'waiting_for_admin_id', 'data': {}}
+        
         print(f"🤖 Bot initialized with token: {token[:10]}...")
         print(f"👑 Bot Owner IDs: {self.owner_ids}")
         self.setup_database()
@@ -562,8 +565,16 @@ class TelegramProtectionBot:
             if 'message' in update:
                 message = update['message']
                 chat_id = message['chat']['id']
+                user_id = message['from']['id'] if 'from' in message else None
                 
                 print(f"📩 Received message in chat {chat_id}")
+                
+                # Check if user is in a state waiting for input
+                if user_id and user_id in self.user_states:
+                    state_info = self.user_states[user_id]
+                    if state_info['state'] == 'waiting_for_admin_id' and 'text' in message:
+                        self.process_admin_id_input(message, user_id)
+                        return
                 
                 # Handle commands
                 if 'text' in message:
@@ -579,7 +590,18 @@ class TelegramProtectionBot:
                             self.show_main_menu(message)
                         elif command == '/help':
                             self.show_help_menu(message)
+                        elif command == '/addadmin' and len(text.split()) > 1:
+                            # Handle /addadmin command with ID
+                            try:
+                                admin_id = int(text.split()[1])
+                                self.add_admin_direct(message, admin_id)
+                            except ValueError:
+                                self.send_message(chat_id, "❌ Invalid admin ID. Please use a number.")
                         else:
+                            self.show_main_menu(message)
+                    else:
+                        # Regular text message - show main menu
+                        if user_id and self.is_authorized_user(user_id):
                             self.show_main_menu(message)
                 
                 # Handle non-admin posts in channels/groups
@@ -658,7 +680,7 @@ class TelegramProtectionBot:
                 self.show_help(chat_id, message_id)
             
             elif callback_data == 'confirm_add_admin':
-                self.request_admin_id(chat_id, message_id)
+                self.request_admin_id(chat_id, message_id, user_id)
             
             elif callback_data.startswith('process_admin_id_'):
                 target_user_id = int(callback_data.replace('process_admin_id_', ''))
@@ -670,6 +692,119 @@ class TelegramProtectionBot:
         except Exception as e:
             print(f"❌ Error processing callback: {e}")
             traceback.print_exc()
+    
+    def process_admin_id_input(self, message, user_id):
+        """Process admin ID input from user"""
+        chat_id = message['chat']['id']
+        text = message['text'].strip()
+        
+        # Clear user state
+        if user_id in self.user_states:
+            del self.user_states[user_id]
+        
+        try:
+            admin_id = int(text)
+            # Call the existing add_admin method
+            self.add_admin_direct(message, admin_id)
+        except ValueError:
+            self.send_message(chat_id, 
+                f"❌ Invalid input: '{text}'\n\n"
+                "Please enter a valid numeric User ID (e.g., 123456789).\n"
+                "Use /menu to go back to the main menu.")
+    
+    def add_admin_direct(self, message, admin_id):
+        """Add admin directly from command or text input"""
+        chat_id = message['chat']['id']
+        user_id = message['from']['id']
+        
+        if not self.is_authorized_user(user_id):
+            self.send_message(chat_id, "❌ You are not authorized to use this command.")
+            return
+        
+        try:
+            cursor = self.conn.cursor()
+            
+            # Check if already an admin
+            cursor.execute('SELECT id, first_name FROM channel_admins WHERE user_id = ? AND is_active = 1', (admin_id,))
+            existing = cursor.fetchone()
+            
+            if existing:
+                success_text = f"""✅ <b>Already Protected</b>
+
+User ID: {admin_id}
+Name: {existing[1]}
+Status: Already a protected admin
+
+Their posts will NOT be auto-deleted."""
+                
+                keyboard = {
+                    'inline_keyboard': [
+                        [{'text': '⚙️ Manage This Admin', 'callback_data': f'select_admin_{admin_id}'}],
+                        [{'text': '📋 View All Admins', 'callback_data': 'list_admins'}],
+                        [{'text': '🔙 Main Menu', 'callback_data': 'main_menu'}]
+                    ]
+                }
+                self.send_message(chat_id, success_text, reply_markup=keyboard)
+                return
+            
+            # Add to database
+            first_name = f"User{admin_id}"
+            cursor.execute('''
+                INSERT INTO channel_admins 
+                (user_id, first_name, added_by, delete_after_seconds, is_active)
+                VALUES (?, ?, ?, 0, 1)
+            ''', (admin_id, first_name, user_id))
+            
+            cursor.execute('UPDATE bot_stats SET total_admins_added = total_admins_added + 1 WHERE id = 1')
+            self.conn.commit()
+            
+            success_text = f"""✅ <b>Admin Added Successfully!</b>
+
+👤 User ID: {admin_id}
+👑 Added by: Bot Owner
+⏰ Default Delete Time: Never (protected)
+
+📝 <b>What this means:</b>
+• This user can now post without auto-deletion
+• Their posts are protected
+• You can set custom delete time per admin
+• Other users' posts will still be deleted"""
+            
+            keyboard = {
+                'inline_keyboard': [
+                    [{'text': '⚙️ Set Delete Time for This Admin', 'callback_data': f'select_admin_{admin_id}'}],
+                    [{'text': '📋 View All Admins', 'callback_data': 'list_admins'}],
+                    [{'text': '➕ Add Another Admin', 'callback_data': 'add_admin'}],
+                    [{'text': '🔙 Main Menu', 'callback_data': 'main_menu'}]
+                ]
+            }
+            
+            self.send_message(chat_id, success_text, reply_markup=keyboard)
+            print(f"✅ Added user {admin_id} as protected admin")
+            
+            # Also send notification to all bot owners
+            for owner_id in self.owner_ids:
+                if owner_id != user_id:  # Don't notify the person who added
+                    try:
+                        notification = f"""👑 <b>New Admin Added</b>
+
+User ID: {admin_id}
+Added by: {message['from'].get('first_name', 'A bot owner')}
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"""
+                        self.send_message(owner_id, notification)
+                    except:
+                        pass
+            
+        except Exception as e:
+            error_text = f"""❌ <b>Error Adding Admin</b>
+
+Error: {str(e)}
+
+Please try again or contact support."""
+            
+            keyboard = self.get_back_button()
+            self.send_message(chat_id, error_text, reply_markup=keyboard)
+            print(f"❌ Error adding admin: {e}")
     
     def handle_start(self, message):
         """Handle /start command"""
@@ -772,8 +907,8 @@ What would you like to do?"""
         
         self.edit_message_text(chat_id, message_id, menu_text, reply_markup=keyboard)
     
-    def request_admin_id(self, chat_id, message_id):
-        """Request admin ID from user"""
+    def request_admin_id(self, chat_id, message_id, user_id):
+        """Request admin ID from user and set state"""
         menu_text = """📝 <b>Enter User ID</b>
 
 Please send the User ID of the person you want to add as a protected admin.
@@ -784,24 +919,35 @@ Format: Just send the number (e.g., 123456789)
         
         keyboard = self.get_back_button()
         self.edit_message_text(chat_id, message_id, menu_text, reply_markup=keyboard)
+        
+        # Set user state to waiting for admin ID
+        self.user_states[user_id] = {
+            'state': 'waiting_for_admin_id',
+            'chat_id': chat_id
+        }
+        print(f"✅ Set state for user {user_id}: waiting_for_admin_id")
     
     def add_admin(self, chat_id, message_id, target_user_id, added_by):
-        """Add a new admin"""
+        """Add a new admin (via callback with pre-set ID)"""
         try:
             cursor = self.conn.cursor()
             
             # Check if already an admin
-            cursor.execute('SELECT id FROM channel_admins WHERE user_id = ? AND is_active = 1', (target_user_id,))
-            if cursor.fetchone():
+            cursor.execute('SELECT id, first_name FROM channel_admins WHERE user_id = ? AND is_active = 1', (target_user_id,))
+            existing = cursor.fetchone()
+            
+            if existing:
                 success_text = f"""✅ <b>Already Protected</b>
 
 User ID: {target_user_id}
+Name: {existing[1]}
 Status: Already a protected admin
 
 Their posts will NOT be auto-deleted."""
                 
                 keyboard = {
                     'inline_keyboard': [
+                        [{'text': '⚙️ Manage This Admin', 'callback_data': f'select_admin_{target_user_id}'}],
                         [{'text': '📋 View All Admins', 'callback_data': 'list_admins'}],
                         [{'text': '🔙 Back to Main', 'callback_data': 'main_menu'}]
                     ]
@@ -834,7 +980,7 @@ Their posts will NOT be auto-deleted."""
             
             keyboard = {
                 'inline_keyboard': [
-                    [{'text': '⏰ Set Delete Time for This Admin', 'callback_data': f'select_admin_{target_user_id}'}],
+                    [{'text': '⚙️ Set Delete Time for This Admin', 'callback_data': f'select_admin_{target_user_id}'}],
                     [{'text': '📋 View All Admins', 'callback_data': 'list_admins'}],
                     [{'text': '🔙 Back to Main', 'callback_data': 'main_menu'}]
                 ]
@@ -1236,7 +1382,13 @@ I automatically delete posts from non-admins and notify about comments.
 4. Set delete times as needed
 
 ❓ <b>How to Get User ID:</b>
-Use @userinfobot or forward a message from the user to @getidsbot"""
+Use @userinfobot or forward a message from the user to @getidsbot
+
+💡 <b>Adding Admins:</b>
+1. Click "Add Admin" in the menu
+2. Click "Enter User ID Manually"
+3. Send the numeric User ID (e.g., 123456789)
+4. The bot will confirm with success message"""
 
         keyboard = {
             'inline_keyboard': [
@@ -1587,6 +1739,7 @@ Use @userinfobot or forward a message from the user to @getidsbot"""
         print("  • /start - Start bot")
         print("  • /menu - Show main menu")
         print("  • /help - Show help")
+        print("  • /addadmin <user_id> - Add admin directly")
         print(f"\n👥 Bot Owners: {len(self.owner_ids)} users")
         
         return True
