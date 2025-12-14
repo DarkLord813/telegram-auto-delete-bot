@@ -1427,7 +1427,7 @@ Use @userinfobot or forward a message from the user to @getidsbot
                 self.handle_comment(message)
                 return
             
-            # Check if user is a protected admin
+            # FIRST: Check if user is a protected admin (THIS IS THE FIX)
             cursor = self.conn.cursor()
             cursor.execute('SELECT delete_after_seconds FROM channel_admins WHERE user_id = ? AND is_active = 1', (user_id,))
             admin_result = cursor.fetchone()
@@ -1442,11 +1442,21 @@ Use @userinfobot or forward a message from the user to @getidsbot
                     return
                 else:
                     print(f"   ⏰ Admin posts will be deleted after {self.format_seconds(delete_seconds)}")
+                    
+                    # Only check bot admin status if we need to delete
+                    if not self.is_bot_admin_in_channel(chat_id):
+                        print(f"⚠️ Bot is not admin in chat {chat_id}, cannot delete admin's post")
+                        return
             else:
                 # Non-admin user - use global delete time
                 cursor.execute('SELECT global_delete_seconds FROM global_settings WHERE id = 1')
                 delete_seconds = cursor.fetchone()[0]
                 print(f"⚠️ Non-admin {user_name} ({user_id}) posted in {chat_id} - Will delete after {self.format_seconds(delete_seconds)}")
+                
+                # Check bot admin status for non-admin posts
+                if not self.is_bot_admin_in_channel(chat_id):
+                    print(f"⚠️ Bot is not admin in chat {chat_id}, cannot delete non-admin post")
+                    return
             
             # If delete_seconds is 0, don't schedule deletion
             if delete_seconds == 0:
@@ -1673,6 +1683,17 @@ Use @userinfobot or forward a message from the user to @getidsbot
             
             for post in posts_to_delete:
                 post_id, channel_id, message_id, user_id, user_name = post
+                
+                # Check if bot is still admin before trying to delete
+                if not self.is_bot_admin_in_channel(channel_id):
+                    print(f"⚠️ Bot is no longer admin in {channel_id}, skipping deletion")
+                    cursor.execute('''
+                        UPDATE non_admin_posts 
+                        SET is_active = 0, deleted_at = datetime('now') 
+                        WHERE id = ?
+                    ''', (post_id,))
+                    self.conn.commit()
+                    continue
                 
                 # Try to delete the message
                 success = self.delete_message(channel_id, message_id)
