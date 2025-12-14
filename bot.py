@@ -1427,44 +1427,72 @@ Use @userinfobot or forward a message from the user to @getidsbot
                 self.handle_comment(message)
                 return
             
-            # FIRST: Check if user is a protected admin (THIS IS THE FIX)
+            # FIRST: Check if user is a protected admin
             cursor = self.conn.cursor()
             cursor.execute('SELECT delete_after_seconds FROM channel_admins WHERE user_id = ? AND is_active = 1', (user_id,))
             admin_result = cursor.fetchone()
             
             if admin_result:
-                # User is protected admin - use their specific delete time
+                # User is protected admin
                 delete_seconds = admin_result[0]
-                print(f"✅ Protected admin {user_name} ({user_id}) posted in {chat_id}")
                 
                 if delete_seconds == 0:
-                    print(f"   ⏰ Admin posts are protected - NOT deleting")
+                    # Admin is COMPLETELY PROTECTED - no deletion at all
+                    print(f"✅ Protected admin {user_name} ({user_id}) posted in {chat_id}")
+                    print(f"   ⏰ Admin is COMPLETELY PROTECTED - NO deletion scheduled")
                     return
                 else:
-                    print(f"   ⏰ Admin posts will be deleted after {self.format_seconds(delete_seconds)}")
+                    # Admin has specific delete time
+                    print(f"✅ Protected admin {user_name} ({user_id}) posted in {chat_id}")
+                    print(f"   ⏰ Admin has specific delete time: {self.format_seconds(delete_seconds)}")
                     
-                    # Only check bot admin status if we need to delete
+                    # Check if bot is admin before scheduling deletion
                     if not self.is_bot_admin_in_channel(chat_id):
-                        print(f"⚠️ Bot is not admin in chat {chat_id}, cannot delete admin's post")
+                        print(f"   ⚠️ Bot is not admin in chat {chat_id}, cannot schedule deletion")
                         return
-            else:
-                # Non-admin user - use global delete time
-                cursor.execute('SELECT global_delete_seconds FROM global_settings WHERE id = 1')
-                delete_seconds = cursor.fetchone()[0]
-                print(f"⚠️ Non-admin {user_name} ({user_id}) posted in {chat_id} - Will delete after {self.format_seconds(delete_seconds)}")
-                
-                # Check bot admin status for non-admin posts
-                if not self.is_bot_admin_in_channel(chat_id):
-                    print(f"⚠️ Bot is not admin in chat {chat_id}, cannot delete non-admin post")
+                    
+                    # Schedule deletion for admin's specific time
+                    self.schedule_message_deletion(
+                        chat_id, message_id, user_id, user_name, 
+                        delete_seconds, "admin_specific"
+                    )
                     return
+            
+            # User is NOT a protected admin - handle as non-admin
+            print(f"⚠️ Non-admin {user_name} ({user_id}) posted in {chat_id}")
+            
+            # Check if bot is admin before scheduling deletion
+            if not self.is_bot_admin_in_channel(chat_id):
+                print(f"   ⚠️ Bot is not admin in chat {chat_id}, cannot schedule deletion")
+                return
+            
+            # Get global delete time
+            cursor.execute('SELECT global_delete_seconds FROM global_settings WHERE id = 1')
+            global_delete_seconds = cursor.fetchone()[0]
+            
+            # Schedule deletion for non-admin
+            self.schedule_message_deletion(
+                chat_id, message_id, user_id, user_name, 
+                global_delete_seconds, "global"
+            )
+            
+        except Exception as e:
+            print(f"❌ Error handling group/channel message: {e}")
+    
+    def schedule_message_deletion(self, chat_id, message_id, user_id, user_name, delete_seconds, delete_type):
+        """Schedule a message for deletion"""
+        try:
+            cursor = self.conn.cursor()
+            
+            # Extract message content
+            # Get message from database context - we'll store minimal info
+            post_content = f"Message from {user_name}"
+            post_type = "unknown"
             
             # If delete_seconds is 0, don't schedule deletion
             if delete_seconds == 0:
+                print(f"   ⏰ {delete_type} delete time is 0 - NOT scheduling deletion")
                 return
-            
-            # Extract message content
-            post_content = self.extract_message_content(message)
-            post_type = self.get_message_type(message)
             
             # Schedule deletion
             scheduled_time = datetime.now() + timedelta(seconds=delete_seconds)
@@ -1479,8 +1507,10 @@ Use @userinfobot or forward a message from the user to @getidsbot
             
             self.conn.commit()
             
+            print(f"   ✅ Scheduled deletion in {self.format_seconds(delete_seconds)} ({delete_type})")
+            
         except Exception as e:
-            print(f"❌ Error handling group/channel message: {e}")
+            print(f"❌ Error scheduling message deletion: {e}")
     
     def handle_channel_post(self, post):
         """Handle posts in channels"""
