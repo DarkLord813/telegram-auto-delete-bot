@@ -49,8 +49,10 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("autodelete-bot")
 
+# Timer presets including 30 seconds
 TIMER_PRESETS = [
     ("Instant", 0),
+    ("30 secs", 30),
     ("1 min", 60),
     ("5 min", 300),
     ("15 min", 900),
@@ -466,7 +468,11 @@ def force_join_keyboard() -> InlineKeyboardMarkup:
 def fmt_delay(seconds: int) -> str:
     if seconds == 0:
         return "Instant"
-    if seconds < 3600:
+    elif seconds == 30:
+        return "30 secs"
+    elif seconds < 60:
+        return f"{seconds} secs"
+    elif seconds < 3600:
         return f"{seconds // 60} min"
     return f"{seconds // 3600} hr"
 
@@ -656,10 +662,20 @@ async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, Inl
 
 
 def timer_menu_markup(chat_id: int) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(label, callback_data=f"ts:{chat_id}:{secs}")]
-        for label, secs in TIMER_PRESETS
-    ]
+    # Split presets into two columns for better display
+    rows = []
+    half = len(TIMER_PRESETS) // 2 + len(TIMER_PRESETS) % 2
+    for i in range(half):
+        row = []
+        if i < len(TIMER_PRESETS):
+            label, secs = TIMER_PRESETS[i]
+            row.append(InlineKeyboardButton(label, callback_data=f"ts:{chat_id}:{secs}"))
+        if i + half < len(TIMER_PRESETS):
+            label, secs = TIMER_PRESETS[i + half]
+            row.append(InlineKeyboardButton(label, callback_data=f"ts:{chat_id}:{secs}"))
+        if row:
+            rows.append(row)
+    
     rows.append([InlineKeyboardButton("✏️ Custom", callback_data=f"tc:{chat_id}")])
     rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"menu:{chat_id}")])
     return InlineKeyboardMarkup(rows)
@@ -667,10 +683,9 @@ def timer_menu_markup(chat_id: int) -> InlineKeyboardMarkup:
 
 async def keywords_menu_markup(chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
     kws = await list_keywords(chat_id)
-    rows = [
-        [InlineKeyboardButton(f"❌ {kw}", callback_data=f"kd:{chat_id}:{i}")]
-        for i, kw in enumerate(kws)
-    ]
+    rows = []
+    for i, kw in enumerate(kws):
+        rows.append([InlineKeyboardButton(f"❌ {kw}", callback_data=f"kd:{chat_id}:{i}")])
     rows.append([InlineKeyboardButton("➕ Add Keyword", callback_data=f"ka:{chat_id}")])
     rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"menu:{chat_id}")])
     text = "*Banned Keywords*\n\nMessages containing any of these from non-approved admins are deleted instantly.\n\n"
