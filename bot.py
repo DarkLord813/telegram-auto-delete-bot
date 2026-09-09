@@ -240,6 +240,27 @@ async def is_approved(chat_id: int, user_id: int) -> bool:
     return row is not None
 
 
+async def list_all_approved(chat_id: int) -> list[dict]:
+    """Every approved row for this chat, including ones approved manually by
+    username that Telegram's live admin list may not currently be returning."""
+    cur = await db.execute(
+        "SELECT user_id, name, username, signature, is_bot FROM approved_admins WHERE chat_id = ?",
+        (chat_id,),
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    return [
+        {
+            "user_id": r[0],
+            "name": r[1],
+            "username": r[2],
+            "signature": r[3],
+            "is_bot": bool(r[4]),
+        }
+        for r in rows
+    ]
+
+
 async def is_approved_multi(chat_id: int, user_id: int | None, username: str | None,
                              full_name: str | None) -> tuple[bool, str]:
     """Approval check with fallbacks: exact user_id match first (authoritative),
@@ -729,6 +750,30 @@ async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, Inl
             "is_self_bot": is_self_bot,
             "status": m.status,
             "custom_title": m.custom_title or ""
+        })
+
+    # Merge in anyone approved by username who isn't in Telegram's live/cached
+    # admin list (e.g. approved just now, before a fresh fetch picked them up,
+    # or Telegram just isn't returning them for this chat right now) — they
+    # must still show up here, ✅ and toggleable, so approval is visible.
+    seen_ids = {a["user_id"] for a in admin_list}
+    for approved_row in await list_all_approved(chat_id):
+        if approved_row["user_id"] in seen_ids:
+            continue
+        name = approved_row["name"] or str(approved_row["user_id"])
+        username = f"@{approved_row['username']}" if approved_row["username"] else ""
+        display_name = f"{name} ({username})" if username else name
+        display_name = f"🔧 {display_name} (manually approved)"
+        admin_list.append({
+            "user_id": approved_row["user_id"],
+            "name": display_name,
+            "full_name": name,
+            "username": username,
+            "approved": True,
+            "is_bot": approved_row["is_bot"],
+            "is_self_bot": False,
+            "status": "manual",
+            "custom_title": approved_row["signature"] or "",
         })
 
     # Sort: show owner first, then self-bot, then other admins
@@ -1508,7 +1553,13 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender_id = message.from_user.id if message.from_user else (message.sender_chat.id if message.sender_chat else None)
     sender_username = message.from_user.username if message.from_user else None
     sender_name = message.from_user.full_name if message.from_user else message.author_signature
-    sender_label = f"@{sender_username}" if sender_username else (sender_name or str(sender_id))
+    parts_label = []
+    if sender_name:
+        parts_label.append(sender_name)
+    if sender_username:
+        parts_label.append(f"@{sender_username}")
+    parts_label.append(f"ID: {sender_id}")
+    sender_label = " / ".join(parts_label)
 
     # Whitelist: if the message matches any whitelisted keyword, it's fully
     # protected — never deleted, regardless of blacklist or admin approval.
@@ -1604,7 +1655,13 @@ async def delete_job(context: ContextTypes.DEFAULT_TYPE):
         log.info(f"Scheduled deletion executed for chat {chat_id}")
         sender_username = data.get("sender_username")
         sender_name = data.get("sender_name")
-        sender_label = f"@{sender_username}" if sender_username else (sender_name or str(data.get("sender_id")))
+        parts_label = []
+        if sender_name:
+            parts_label.append(sender_name)
+        if sender_username:
+            parts_label.append(f"@{sender_username}")
+        parts_label.append(f"ID: {data.get('sender_id')}")
+        sender_label = " / ".join(parts_label)
         await notify_deletion(
             context, chat_id, data.get("chat_title", str(chat_id)), sender_label,
             "non-approved admin", data.get("snippet", ""),
