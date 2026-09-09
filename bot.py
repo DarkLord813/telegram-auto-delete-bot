@@ -33,12 +33,12 @@ from telegram.ext import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL", "NCK_Dev")  # username, no @
+FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL", "NCK_Dev")
 FORCE_JOIN_CHANNEL_LINK = os.getenv("FORCE_JOIN_CHANNEL_LINK", "https://t.me/NCK_Dev")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "bot.db")
 PORT = int(os.getenv("PORT", "8080"))
 KEEP_ALIVE_ENABLED = os.getenv("KEEP_ALIVE_ENABLED", "true").lower() == "true"
-DEFAULT_DELETE_DELAY = int(os.getenv("DEFAULT_DELETE_DELAY", "300"))  # 5 minutes
+DEFAULT_DELETE_DELAY = int(os.getenv("DEFAULT_DELETE_DELAY", "300"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Set it in your environment or a .env file.")
@@ -59,7 +59,7 @@ TIMER_PRESETS = [
     ("1 hour", 3600),
 ]
 
-# Default banned keywords (apply to non-approved admins only)
+# Default banned keywords
 DEFAULT_BANNED_KEYWORDS = [
     "sex", "18+", "porn", "xxx", "nsfw", "adult", "nude", "naked",
     "fuck", "shit", "asshole", "bitch", "cunt", "dick", "pussy",
@@ -70,7 +70,6 @@ DEFAULT_BANNED_KEYWORDS = [
 
 MANAGEABLE_TYPES = (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL)
 
-# in-memory state for "waiting on a free-text reply" flows
 PENDING_INPUT: dict[tuple[int, int], tuple[str, int]] = {}
 
 db: aiosqlite.Connection | None = None
@@ -168,7 +167,6 @@ async def mark_bot_admin(chat_id: int, title: str | None, chat_type: str, is_adm
 
 
 async def list_known_chats() -> list[tuple[int, str, str]]:
-    """Chats where the bot currently believes it's an admin."""
     cur = await db.execute(
         "SELECT chat_id, title, type FROM chats WHERE bot_is_admin = 1 ORDER BY title"
     )
@@ -185,8 +183,8 @@ async def get_settings(chat_id: int) -> dict:
     row = await cur.fetchone()
     await cur.close()
     return {
-        "delete_delay": row[0], 
-        "force_join": bool(row[1]), 
+        "delete_delay": row[0],
+        "force_join": bool(row[1]),
         "enabled": bool(row[2]),
         "managing_started": bool(row[3])
     }
@@ -217,7 +215,6 @@ async def toggle_enabled(chat_id: int) -> bool:
 
 
 async def start_managing(chat_id: int) -> bool:
-    """Start managing a chat - enables auto-delete and marks as started."""
     await db.execute(
         "UPDATE chats SET enabled = 1, managing_started = 1 WHERE chat_id = ?", (chat_id,)
     )
@@ -226,7 +223,6 @@ async def start_managing(chat_id: int) -> bool:
 
 
 async def is_managing_started(chat_id: int) -> bool:
-    """Check if managing has been started for this chat."""
     s = await get_settings(chat_id)
     return s["managing_started"]
 
@@ -387,8 +383,7 @@ async def remove_whitelist_keyword_by_index(chat_id: int, index: int):
 
 async def approve_admin(chat_id: int, user_id: int, name: str, username: str | None,
                          signature: str | None, is_bot: bool = False):
-    """Unconditional approve (not a toggle) — used by the approve-by-username flow
-    so resubmitting the same username doesn't flip it back off."""
+    """Unconditional approve (not a toggle)."""
     await ensure_chat(chat_id)
     await db.execute(
         "INSERT OR REPLACE INTO approved_admins (chat_id, user_id, name, username, signature, is_bot) "
@@ -396,6 +391,7 @@ async def approve_admin(chat_id: int, user_id: int, name: str, username: str | N
         (chat_id, user_id, name, username, signature, int(is_bot)),
     )
     await db.commit()
+    log.info(f"✅ Approved admin {user_id} (@{username}) with signature '{signature}' in chat {chat_id}")
 
 
 async def is_notify_subscribed(chat_id: int, user_id: int) -> bool:
@@ -409,8 +405,6 @@ async def is_notify_subscribed(chat_id: int, user_id: int) -> bool:
 
 
 async def toggle_notify_subscription(chat_id: int, user_id: int) -> bool:
-    """Toggle whether this user gets DM'd when a message is deleted in this
-    chat. Returns the new state."""
     if await is_notify_subscribed(chat_id, user_id):
         await db.execute(
             "DELETE FROM delete_notify_subscribers WHERE chat_id = ? AND user_id = ?",
@@ -436,7 +430,6 @@ async def list_notify_subscribers(chat_id: int) -> list[int]:
 
 
 async def init_default_keywords(chat_id: int):
-    """Initialize default banned keywords for a new chat."""
     existing = await list_keywords(chat_id)
     for kw in DEFAULT_BANNED_KEYWORDS:
         if kw not in existing:
@@ -444,7 +437,6 @@ async def init_default_keywords(chat_id: int):
 
 
 async def remove_chat_from_management(chat_id: int, reason: str = "User removed"):
-    """Remove a chat from the bot's management list."""
     await db.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
     await db.execute("DELETE FROM approved_admins WHERE chat_id = ?", (chat_id,))
     await db.execute("DELETE FROM banned_keywords WHERE chat_id = ?", (chat_id,))
@@ -458,7 +450,6 @@ async def remove_chat_from_management(chat_id: int, reason: str = "User removed"
 
 
 async def is_chat_removed(chat_id: int) -> bool:
-    """Check if a chat has been removed from management."""
     cur = await db.execute("SELECT 1 FROM removed_chats WHERE chat_id = ?", (chat_id,))
     row = await cur.fetchone()
     await cur.close()
@@ -466,14 +457,12 @@ async def is_chat_removed(chat_id: int) -> bool:
 
 
 async def restore_chat(chat_id: int):
-    """Restore a previously removed chat."""
     await db.execute("DELETE FROM removed_chats WHERE chat_id = ?", (chat_id,))
     await db.commit()
     log.info(f"Chat {chat_id} restored to management")
 
 
 async def list_removed_chats() -> list[tuple[int, str, int]]:
-    """List all removed chats."""
     cur = await db.execute(
         "SELECT chat_id, reason, removed_at FROM removed_chats ORDER BY removed_at DESC"
     )
@@ -483,7 +472,6 @@ async def list_removed_chats() -> list[tuple[int, str, int]]:
 
 
 async def store_all_admins(chat_id: int, admins: List[ChatMember]):
-    """Store all admins in the database for better tracking."""
     for admin in admins:
         await db.execute(
             """INSERT OR REPLACE INTO all_admins 
@@ -504,7 +492,6 @@ async def store_all_admins(chat_id: int, admins: List[ChatMember]):
 
 
 async def get_all_admins(chat_id: int) -> list[dict]:
-    """Get all stored admins for a chat."""
     cur = await db.execute(
         "SELECT user_id, name, username, is_bot, status FROM all_admins WHERE chat_id = ?",
         (chat_id,)
@@ -528,10 +515,6 @@ async def get_all_admins(chat_id: int) -> list[dict]:
 # --------------------------------------------------------------------------
 
 def list_all_functions() -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Returns a categorized list of all functions in this module.
-    Useful for documentation and debugging.
-    """
     current_module = inspect.getmodule(inspect.currentframe())
     functions = {
         "Database Operations": [],
@@ -543,7 +526,7 @@ def list_all_functions() -> Dict[str, List[Dict[str, Any]]]:
         "Entrypoint": [],
         "Web Server": [],
     }
-    
+
     for name, obj in inspect.getmembers(current_module):
         if inspect.isfunction(obj) and obj.__module__ == current_module.__name__:
             func_info = {
@@ -551,26 +534,29 @@ def list_all_functions() -> Dict[str, List[Dict[str, Any]]]:
                 "doc": inspect.getdoc(obj) or "No description",
                 "signature": str(inspect.signature(obj)),
             }
-            
-            # Categorize functions
+
             if name.startswith(("init_db", "ensure_chat", "mark_bot_admin", "list_known_chats",
                                "get_settings", "set_delete_delay", "toggle_force_join",
                                "toggle_enabled", "is_approved", "toggle_approved",
                                "is_signature_approved", "list_keywords", "add_keyword",
                                "remove_keyword_by_index", "init_default_keywords",
-                               "remove_chat_from_management", "is_chat_removed", 
+                               "remove_chat_from_management", "is_chat_removed",
                                "restore_chat", "list_removed_chats", "start_managing",
-                               "is_managing_started", "store_all_admins", "get_all_admins")):
+                               "is_managing_started", "store_all_admins", "get_all_admins",
+                               "is_approved_multi", "approve_admin", "is_notify_subscribed",
+                               "toggle_notify_subscription", "list_notify_subscribers")):
                 functions["Database Operations"].append(func_info)
-            elif name in ("user_is_chat_admin", "user_joined_force_channel", 
+            elif name in ("user_is_chat_admin", "user_joined_force_channel",
                          "force_join_keyboard", "fmt_delay"):
                 functions["Telegram Helpers"].append(func_info)
             elif name in ("main_menu_markup", "admins_menu_markup", "timer_menu_markup",
-                         "keywords_menu_markup", "build_chat_picker", "removed_chats_markup"):
+                         "keywords_menu_markup", "whitelist_menu_markup",
+                         "build_chat_picker", "removed_chats_markup"):
                 functions["UI/Menu Builders"].append(func_info)
-            elif name in ("start_cmd", "callback_router", "text_and_moderation_handler"):
+            elif name in ("start_cmd", "callback_router", "text_and_moderation_handler",
+                         "my_chat_member_update"):
                 functions["Command Handlers"].append(func_info)
-            elif name in ("moderate_message", "delete_job"):
+            elif name in ("moderate_message", "delete_job", "notify_deletion"):
                 functions["Moderation"].append(func_info)
             elif name in ("list_all_functions",):
                 functions["Utility"].append(func_info)
@@ -578,7 +564,7 @@ def list_all_functions() -> Dict[str, List[Dict[str, Any]]]:
                 functions["Web Server"].append(func_info)
             elif name == "main":
                 functions["Entrypoint"].append(func_info)
-    
+
     return functions
 
 
@@ -629,27 +615,23 @@ def fmt_delay(seconds: int) -> str:
 
 
 # --------------------------------------------------------------------------
-# Menu builders (every callback_data below carries the TARGET chat_id so
-# these work identically whether triggered inside the chat itself or from
-# a private-chat picker)
+# Menu builders
 # --------------------------------------------------------------------------
 
 async def main_menu_markup(chat_id: int, in_dm: bool, user_id: int) -> InlineKeyboardMarkup:
     s = await get_settings(chat_id)
     rows = []
-    
-    # Show Start Managing button if not started
+
     if not s["managing_started"]:
         rows.append([InlineKeyboardButton("🚀 START MANAGING", callback_data=f"start_mgmt:{chat_id}")])
         rows.append([InlineKeyboardButton("ℹ️ Setup Required", callback_data="noop")])
-    
+
     rows.append([InlineKeyboardButton("👮 Approved Admins", callback_data=f"adm:{chat_id}")])
     rows.append([InlineKeyboardButton(f"⏱ Deletion Timer ({fmt_delay(s['delete_delay'])})",
                                callback_data=f"tmr:{chat_id}")])
     rows.append([InlineKeyboardButton("🚫 Blacklist", callback_data=f"kw:{chat_id}")])
     rows.append([InlineKeyboardButton("✅ Whitelist", callback_data=f"wl:{chat_id}")])
-    
-    # Only show toggle buttons if managing has started
+
     if s["managing_started"]:
         rows.append([InlineKeyboardButton(
             f"{'🟢' if s['enabled'] else '🔴'} Auto-Delete: {'ON' if s['enabled'] else 'OFF'}",
@@ -664,7 +646,7 @@ async def main_menu_markup(chat_id: int, in_dm: bool, user_id: int) -> InlineKey
     rows.append([InlineKeyboardButton(
         f"{'🔔' if notify_on else '🔕'} Delete Notifications: {'ON' if notify_on else 'OFF'}",
         callback_data=f"tn:{chat_id}")])
-    
+
     if in_dm:
         rows.append([InlineKeyboardButton("🔄 Refresh Admins", callback_data=f"refresh_admins:{chat_id}")])
         rows.append([InlineKeyboardButton("🗑 Remove Chat", callback_data=f"rm:{chat_id}")])
@@ -676,70 +658,58 @@ async def main_menu_markup(chat_id: int, in_dm: bool, user_id: int) -> InlineKey
 
 async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     try:
-        # Get admins from Telegram API
         admins = await bot.get_chat_administrators(chat_id)
         log.info(f"Found {len(admins)} admins from Telegram API for chat {chat_id}")
-        
-        # Store all admins in database for tracking
         await store_all_admins(chat_id, admins)
-        
+
     except TelegramError as e:
         log.error(f"Couldn't fetch admin list: {e}")
-        # Try to get from database if API fails
         stored_admins = await get_all_admins(chat_id)
         if stored_admins:
             log.info(f"Using {len(stored_admins)} stored admins from database")
-            # Convert stored admins to ChatMember-like objects
             admins = []
             for admin in stored_admins:
-                # Create a simple object with user attribute
                 class User:
                     def __init__(self, data):
                         self.id = data['user_id']
                         self.full_name = data['name']
                         self.username = data['username']
                         self.is_bot = data['is_bot']
-                
+
                 class Member:
                     def __init__(self, data):
                         self.user = User(data)
                         self.status = data['status']
                         self.custom_title = ""
-                
+
                 admins.append(Member(admin))
         else:
             return "Couldn't fetch admin list — is the bot an admin here?", InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🔙 Back", callback_data=f"menu:{chat_id}")]]
             )
 
-    # Get bot's own user ID to highlight it
     bot_user = await bot.get_me()
     bot_id = bot_user.id
 
-    # Include ALL admins including bots and the bot itself
     admin_list = []
     for m in admins:
         is_bot = m.user.is_bot
         is_self_bot = m.user.id == bot_id
-        
-        # Check if already approved
+
         approved = await is_approved(chat_id, m.user.id)
-        
-        # Get display name
+
         name = m.user.full_name or str(m.user.id)
         username = f"@{m.user.username}" if m.user.username else ""
-        
-        # Build display name
+
         display_name = name
         if username:
             display_name = f"{display_name} ({username})"
-        
-        # Add emoji indicators
+
         if is_self_bot:
             display_name = f"🤖 {display_name} (Self)"
         elif is_bot:
             display_name = f"🤖 {display_name}"
-        
+
         admin_list.append({
             "user_id": m.user.id,
             "name": display_name,
@@ -752,10 +722,7 @@ async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, Inl
             "custom_title": m.custom_title or ""
         })
 
-    # Merge in anyone approved by username who isn't in Telegram's live/cached
-    # admin list (e.g. approved just now, before a fresh fetch picked them up,
-    # or Telegram just isn't returning them for this chat right now) — they
-    # must still show up here, ✅ and toggleable, so approval is visible.
+    # Merge in anyone approved by username who isn't in Telegram's live/cached admin list
     seen_ids = {a["user_id"] for a in admin_list}
     for approved_row in await list_all_approved(chat_id):
         if approved_row["user_id"] in seen_ids:
@@ -776,46 +743,39 @@ async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, Inl
             "custom_title": approved_row["signature"] or "",
         })
 
-    # Sort: show owner first, then self-bot, then other admins
     admin_list.sort(key=lambda x: (
         0 if x['status'] == ChatMemberStatus.OWNER else 1,
         0 if x['is_self_bot'] else 1,
         x['full_name'].lower()
     ))
 
-    # Pagination: show 10 per page
     ITEMS_PER_PAGE = 10
     total_pages = (len(admin_list) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
     if page >= total_pages:
         page = 0
-    
+
     start_idx = page * ITEMS_PER_PAGE
     end_idx = min(start_idx + ITEMS_PER_PAGE, len(admin_list))
     page_admins = admin_list[start_idx:end_idx]
 
     rows = []
     for admin in page_admins:
-        # Build the label with status indicators
         label = f"{'✅' if admin['approved'] else '⬜'} {admin['name']}"
-        
-        # Add owner crown
+
         if admin['status'] == ChatMemberStatus.OWNER:
             label = f"👑 {label}"
-        
-        # Add custom title if available
+
         if admin['custom_title']:
             label = f"{label} [{admin['custom_title']}]"
-        
-        # Disable toggling for self-bot (can't approve/unapprove itself)
+
         if admin['is_self_bot']:
             rows.append([InlineKeyboardButton(label, callback_data="noop")])
         else:
             rows.append([InlineKeyboardButton(
-                label, 
+                label,
                 callback_data=f"at:{chat_id}:{admin['user_id']}"
             )])
 
-    # Add pagination buttons if needed
     nav_buttons = []
     if total_pages > 1:
         if page > 0:
@@ -827,11 +787,10 @@ async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, Inl
 
     rows.append([InlineKeyboardButton("➕ Approve Bot/Admin by Username", callback_data=f"aub:{chat_id}")])
     rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"menu:{chat_id}")])
-    
-    # Count bots and humans
+
     bot_count = sum(1 for a in admin_list if a['is_bot'])
     human_count = len(admin_list) - bot_count
-    
+
     text = (
         "*All Admins (Including Bots)*\n\n"
         f"👤 Humans: {human_count} | 🤖 Bots: {bot_count} | ⭐ This bot\n\n"
@@ -847,7 +806,6 @@ async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, Inl
 
 
 def timer_menu_markup(chat_id: int) -> InlineKeyboardMarkup:
-    # Split presets into two columns for better display
     rows = []
     half = len(TIMER_PRESETS) // 2 + len(TIMER_PRESETS) % 2
     for i in range(half):
@@ -860,7 +818,7 @@ def timer_menu_markup(chat_id: int) -> InlineKeyboardMarkup:
             row.append(InlineKeyboardButton(label, callback_data=f"ts:{chat_id}:{secs}"))
         if row:
             rows.append(row)
-    
+
     rows.append([InlineKeyboardButton("✏️ Custom", callback_data=f"tc:{chat_id}")])
     rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"menu:{chat_id}")])
     return InlineKeyboardMarkup(rows)
@@ -902,7 +860,7 @@ async def build_chat_picker(bot, user_id: int) -> tuple[str, InlineKeyboardMarku
     known = await list_known_chats()
     removed = await list_removed_chats()
     removed_ids = [r[0] for r in removed]
-    
+
     rows = []
     for chat_id, title, ctype in known:
         if chat_id in removed_ids:
@@ -914,14 +872,13 @@ async def build_chat_picker(bot, user_id: int) -> tuple[str, InlineKeyboardMarku
             rows.append(
                 [InlineKeyboardButton(f"{icon} {status} {title or chat_id}", callback_data=f"sel:{chat_id}")]
             )
-    
-    # Add removed chats section if any
+
     if removed:
         rows.append([InlineKeyboardButton("—" * 20, callback_data="noop")])
         rows.append([InlineKeyboardButton("🗑 Removed Chats", callback_data="removed_list")])
-    
+
     rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="chats")])
-    
+
     if rows[:-1]:
         text = "*Your Chats*\n\nPick a group or channel to manage:\n✅ = Managing active | ⏳ = Setup pending"
     else:
@@ -941,23 +898,23 @@ async def removed_chats_markup() -> tuple[str, InlineKeyboardMarkup]:
         return "*Removed Chats*\n\nNo chats have been removed.", InlineKeyboardMarkup(
             [[InlineKeyboardButton("🔙 Back", callback_data="chats")]]
         )
-    
+
     rows = []
     for chat_id, reason, removed_at in removed:
         time_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(removed_at))
         rows.append([
             InlineKeyboardButton(
-                f"🔄 Restore {chat_id}", 
+                f"🔄 Restore {chat_id}",
                 callback_data=f"restore:{chat_id}"
             )
         ])
         rows.append([
             InlineKeyboardButton(
-                f"  📝 {reason[:30]} ({time_str})", 
+                f"  📝 {reason[:30]} ({time_str})",
                 callback_data="noop"
             )
         ])
-    
+
     rows.append([InlineKeyboardButton("🔙 Back", callback_data="chats")])
     text = "*🗑 Removed Chats*\n\nTap 'Restore' to add a chat back to management."
     return text, InlineKeyboardMarkup(rows)
@@ -1002,14 +959,13 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "**Tip:** Use 'Refresh Admins' to update the admin list"
         )
         picker_text, picker_markup = await build_chat_picker(context.bot, user.id)
-        
-        # Send the main message with add buttons for both groups and channels
+
         await update.effective_message.reply_text(
             text,
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(
-                    "➕ Add to Group", 
+                    "➕ Add to Group",
                     url=f"https://t.me/{context.bot.username}?startgroup=true"
                 )],
                 [InlineKeyboardButton(
@@ -1023,7 +979,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Groups, supergroups, and channels: no in-chat interaction at all.
     try:
         await update.effective_message.delete()
     except TelegramError:
@@ -1031,7 +986,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --------------------------------------------------------------------------
-# Track chats the bot is admin in, so the DM picker can list them.
+# Track chats the bot is admin in
 # --------------------------------------------------------------------------
 
 async def my_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1041,17 +996,14 @@ async def my_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
         return
     new_status = result.new_chat_member.status
     is_admin_now = new_status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
-    
-    # Check if chat was removed - if so, restore it when bot becomes admin again
+
     if is_admin_now and await is_chat_removed(chat.id):
         await restore_chat(chat.id)
-    
+
     await mark_bot_admin(chat.id, chat.title, chat.type, is_admin_now)
-    
-    # Initialize default keywords when bot is first added
+
     if is_admin_now:
         await init_default_keywords(chat.id)
-        # Fetch and store all admins immediately
         try:
             admins = await context.bot.get_chat_administrators(chat.id)
             await store_all_admins(chat.id, admins)
@@ -1061,7 +1013,7 @@ async def my_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 # --------------------------------------------------------------------------
-# Callback query router (all inline-button navigation)
+# Callback router
 # --------------------------------------------------------------------------
 
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1086,7 +1038,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         return
 
-    # --- mandatory join gate for absolutely everything else ---
     if not await user_joined_force_channel(context.bot, user.id):
         await query.answer("🔒 Join our channel first — see /start.", show_alert=True)
         try:
@@ -1128,10 +1079,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except TelegramError:
             title = str(target_chat_id)
             chat_type = "Unknown"
-        
+
         managing_started = await is_managing_started(target_chat_id)
         status_text = "✅ Active" if managing_started else "⏳ Setup Required"
-        
+
         await query.edit_message_text(
             f"⚙️ *Managing:* {title}\n"
             f"📋 Type: {chat_type}\n"
@@ -1142,7 +1093,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # every remaining action carries the target chat_id as parts[1]
     if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
         await query.answer()
         return
@@ -1154,7 +1104,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
 
-    # Handle Refresh Admins action
     if action == "refresh_admins":
         try:
             admins = await context.bot.get_chat_administrators(target_chat_id)
@@ -1170,10 +1119,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(f"Error refreshing admins: {str(e)[:50]}", show_alert=True)
             return
 
-    # Handle Start Managing action
     if action == "start_mgmt":
         await start_managing(target_chat_id)
-        # Also refresh admins when starting
         try:
             admins = await context.bot.get_chat_administrators(target_chat_id)
             await store_all_admins(target_chat_id, admins)
@@ -1200,20 +1147,19 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, markup = await admins_menu_markup(context.bot, target_chat_id, page)
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
 
-    elif action == "ap":  # admin page navigation
+    elif action == "ap":
         page = int(parts[2])
         text, markup = await admins_menu_markup(context.bot, target_chat_id, page)
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
 
-    elif action == "at":  # admin toggle: at:<chat_id>:<user_id>
+    elif action == "at":
         target_user_id = int(parts[2])
-        
-        # Don't allow toggling the bot itself
+
         bot_user = await context.bot.get_me()
         if target_user_id == bot_user.id:
             await query.answer("Cannot toggle the bot itself!", show_alert=True)
             return
-            
+
         try:
             member = await context.bot.get_chat_member(target_chat_id, target_user_id)
             name = member.user.full_name or str(member.user.id)
@@ -1234,7 +1180,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=timer_menu_markup(target_chat_id),
         )
 
-    elif action == "ts":  # timer set: ts:<chat_id>:<seconds>
+    elif action == "ts":
         seconds = int(parts[2])
         await set_delete_delay(target_chat_id, seconds)
         await query.edit_message_text(
@@ -1243,7 +1189,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=await main_menu_markup(target_chat_id, in_dm, user.id),
         )
 
-    elif action == "tc":  # timer custom prompt
+    elif action == "tc":
         PENDING_INPUT[(reply_chat.id, user.id)] = ("custom_timer", target_chat_id)
         await query.edit_message_text(
             "✏️ Send the delay in *minutes* as a message here (e.g. `10`).",
@@ -1257,7 +1203,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, markup = await keywords_menu_markup(target_chat_id)
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
 
-    elif action == "ka":  # keyword add prompt
+    elif action == "ka":
         PENDING_INPUT[(reply_chat.id, user.id)] = ("add_keyword", target_chat_id)
         await query.edit_message_text(
             "✏️ Send the keyword or phrase to ban, as a message here.",
@@ -1266,17 +1212,17 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
         )
 
-    elif action == "kd":  # keyword delete: kd:<chat_id>:<index>
+    elif action == "kd":
         index = int(parts[2])
         await remove_keyword_by_index(target_chat_id, index)
         text, markup = await keywords_menu_markup(target_chat_id)
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
 
-    elif action == "wl":  # whitelist menu
+    elif action == "wl":
         text, markup = await whitelist_menu_markup(target_chat_id)
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
 
-    elif action == "wa":  # whitelist add prompt
+    elif action == "wa":
         PENDING_INPUT[(reply_chat.id, user.id)] = ("add_whitelist", target_chat_id)
         await query.edit_message_text(
             "✏️ Send the keyword or phrase to whitelist, as a message here.",
@@ -1285,13 +1231,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
         )
 
-    elif action == "wd":  # whitelist delete: wd:<chat_id>:<index>
+    elif action == "wd":
         index = int(parts[2])
         await remove_whitelist_keyword_by_index(target_chat_id, index)
         text, markup = await whitelist_menu_markup(target_chat_id)
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
 
-    elif action == "aub":  # approve bot/admin by username prompt
+    elif action == "aub":
         PENDING_INPUT[(reply_chat.id, user.id)] = ("approve_bot_username", target_chat_id)
         await query.edit_message_text(
             "✏️ Send the *username* of the bot or admin to approve (with or "
@@ -1302,7 +1248,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
         )
 
-    elif action == "tf":  # toggle force-join
+    elif action == "tf":
         await toggle_force_join(target_chat_id)
         await query.edit_message_text(
             "⚙️ *Auto-Delete Settings*",
@@ -1310,7 +1256,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=await main_menu_markup(target_chat_id, in_dm, user.id),
         )
 
-    elif action == "te":  # toggle enabled
+    elif action == "te":
         await toggle_enabled(target_chat_id)
         await query.edit_message_text(
             "⚙️ *Auto-Delete Settings*",
@@ -1318,7 +1264,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=await main_menu_markup(target_chat_id, in_dm, user.id),
         )
 
-    elif action == "tn":  # toggle delete-notifications for the viewing user
+    elif action == "tn":
         await toggle_notify_subscription(target_chat_id, user.id)
         await query.edit_message_text(
             "⚙️ *Auto-Delete Settings*",
@@ -1326,7 +1272,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=await main_menu_markup(target_chat_id, in_dm, user.id),
         )
 
-    elif action == "rm":  # remove chat
+    elif action == "rm":
         await query.edit_message_text(
             f"⚠️ *Remove Chat*\n\n"
             f"Are you sure you want to remove this chat from management?\n\n"
@@ -1341,8 +1287,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("❌ Cancel", callback_data=f"menu:{target_chat_id}")]
             ])
         )
-    
-    elif action == "rm_confirm":  # confirm removal
+
+    elif action == "rm_confirm":
         await remove_chat_from_management(target_chat_id, "Removed by user")
         await query.edit_message_text(
             f"✅ Chat has been removed from management.\n\n"
@@ -1353,7 +1299,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         )
 
-    elif action == "restore":  # restore removed chat
+    elif action == "restore":
         chat_id_to_restore = target_chat_id
         await restore_chat(chat_id_to_restore)
         try:
@@ -1361,7 +1307,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if bot_member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
                 await mark_bot_admin(chat_id_to_restore, None, None, True)
                 await init_default_keywords(chat_id_to_restore)
-                # Refresh admins on restore
                 try:
                     admins = await context.bot.get_chat_administrators(chat_id_to_restore)
                     await store_all_admins(chat_id_to_restore, admins)
@@ -1406,8 +1351,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --------------------------------------------------------------------------
-# Free-text handler — only used for the two "type a value" flows above,
-# and otherwise falls through to group/channel message moderation.
+# Free-text handler
 # --------------------------------------------------------------------------
 
 async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1420,7 +1364,6 @@ async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFA
 
     key = (chat.id, user.id) if user else None
 
-    # --- pending "type a value" flow from an admin menu ---
     if key and key in PENDING_INPUT:
         action, target_chat_id = PENDING_INPUT.pop(key)
         text = (message.text or "").strip()
@@ -1466,11 +1409,15 @@ async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFA
             if not username:
                 await message.reply_text("Please send a valid username.")
                 return
+
+            # Fetch user info from Telegram
             try:
                 resolved = await context.bot.get_chat(f"@{username}")
             except TelegramError:
                 await message.reply_text(f"❌ Couldn't find @{username}. Check the username and try again.")
                 return
+
+            # Check if user is a member of the chat
             try:
                 member = await context.bot.get_chat_member(target_chat_id, resolved.id)
             except TelegramError:
@@ -1478,22 +1425,41 @@ async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFA
                     f"❌ @{username} isn't a member of that chat, so it can't be approved."
                 )
                 return
+
             if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
                 await message.reply_text(
                     f"⚠️ @{username} isn't an admin of that chat — only admins are subject to "
                     f"filtering, so approving a non-admin has no effect. Promote it first."
                 )
                 return
+
+            # Get user info
             name = member.user.full_name or username
+            signature = member.custom_title
+
+            # Store approval with both user_id AND signature
             await approve_admin(
-                target_chat_id, resolved.id, name, member.user.username,
-                member.custom_title, member.user.is_bot,
+                target_chat_id,
+                resolved.id,
+                name,
+                member.user.username,
+                signature,  # Store custom title for channel matching
+                member.user.is_bot
             )
+
             kind = "bot" if member.user.is_bot else "admin"
-            await message.reply_text(f"✅ Approved @{username} ({kind}, ID: {resolved.id}).")
+
+            # Build response
+            response = f"✅ Approved @{username} ({kind}, ID: {resolved.id})"
+            if signature:
+                response += f"\n📝 Custom Title: '{signature}' (used for channel posts)"
+            else:
+                response += f"\n📝 No custom title set. For channel posts, set a custom title first."
+
+            await message.reply_text(response)
             return
 
-    # --- otherwise: normal group/channel message moderation ---
+    # Normal group/channel message moderation
     if chat.type == ChatType.PRIVATE:
         return
     await moderate_message(update, context)
@@ -1519,94 +1485,129 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = message.text or message.caption or ""
 
-    # 1) Check if sender is an admin (for keyword filtering - applies to non-approved admins only)
-    is_admin = False
-    is_approved_admin = False
-    signature = None
-    
     # Don't moderate the bot's own messages
     bot_user = await context.bot.get_me()
     if message.from_user and message.from_user.id == bot_user.id:
         return
-    
-    if message.sender_chat and message.sender_chat.id == chat.id:
-        # Anonymous group admin or channel post
-        signature = message.author_signature
-        if signature:
-            is_admin = True
-            is_approved_admin = await is_signature_approved(chat.id, signature)
-    elif message.from_user:
-        # Check if user is admin
-        if await user_is_chat_admin(context.bot, chat.id, message.from_user.id):
-            is_admin = True
-            is_approved_admin, method = await is_approved_multi(
-                chat.id, message.from_user.id, message.from_user.username,
-                message.from_user.full_name,
-            )
-            if is_approved_admin:
-                log.info(
-                    f"Admin {message.from_user.id} (@{message.from_user.username}) "
-                    f"approved in chat {chat.id} via {method} match"
-                )
 
-    # Sender identity, needed for both approval checks and any delete notification
-    sender_id = message.from_user.id if message.from_user else (message.sender_chat.id if message.sender_chat else None)
-    sender_username = message.from_user.username if message.from_user else None
-    sender_name = message.from_user.full_name if message.from_user else message.author_signature
+    is_admin = False
+    is_approved_admin = False
+    signature = None
+    sender_id = None
+    sender_username = None
+    sender_name = None
+
+    # Check if this is a channel post or anonymous group admin
+    if message.sender_chat and message.sender_chat.id == chat.id:
+        # Channel post or anonymous group admin
+        signature = message.author_signature
+        sender_name = signature or "Anonymous"
+        sender_id = message.sender_chat.id  # Channel ID (for reference only)
+
+        if signature:
+            is_admin = True  # Channel admins are always admins
+            is_approved_admin = await is_signature_approved(chat.id, signature)
+            log.info(f"Channel post: signature='{signature}', approved={is_approved_admin}")
+        else:
+            # No signature means we can't identify the admin
+            log.info("Channel post with no signature - cannot identify admin, leaving message")
+            return
+    elif message.from_user:
+        # Regular user or bot
+        sender_id = message.from_user.id
+        sender_username = message.from_user.username
+        sender_name = message.from_user.full_name
+
+        # Check if user is admin
+        is_admin = await user_is_chat_admin(context.bot, chat.id, sender_id)
+
+        if is_admin:
+            # Check by user_id
+            is_approved_admin = await is_approved(chat.id, sender_id)
+            if is_approved_admin:
+                log.info(f"✅ Admin {sender_id} approved by user_id")
+            else:
+                # Check by username
+                if sender_username:
+                    approved_by_username = await is_approved_multi(chat.id, None, sender_username, None)
+                    if approved_by_username[0]:
+                        is_approved_admin = True
+                        # Add to approved list
+                        await approve_admin(
+                            chat.id, sender_id, sender_name, sender_username,
+                            None, message.from_user.is_bot
+                        )
+                        log.info(f"✅ Admin {sender_id} approved by username and added to DB")
+
+                # Check by full name
+                if not is_approved_admin and sender_name:
+                    approved_by_name = await is_approved_multi(chat.id, None, None, sender_name)
+                    if approved_by_name[0]:
+                        is_approved_admin = True
+                        await approve_admin(
+                            chat.id, sender_id, sender_name, sender_username,
+                            None, message.from_user.is_bot
+                        )
+                        log.info(f"✅ Admin {sender_id} approved by name and added to DB")
+
+    log.info(f"📊 Message from {sender_name} (ID: {sender_id}): is_admin={is_admin}, is_approved_admin={is_approved_admin}")
+
+    # If not an admin, don't moderate
+    if not is_admin:
+        return
+
+    # If admin is approved, DON'T delete anything
+    if is_approved_admin:
+        log.info(f"✅ SKIPPING deletion - admin is approved")
+        return
+
+    # Build sender label for notifications
     parts_label = []
     if sender_name:
         parts_label.append(sender_name)
     if sender_username:
         parts_label.append(f"@{sender_username}")
-    parts_label.append(f"ID: {sender_id}")
+    if sender_id:
+        parts_label.append(f"ID: {sender_id}")
     sender_label = " / ".join(parts_label)
 
-    # Whitelist: if the message matches any whitelisted keyword, it's fully
-    # protected — never deleted, regardless of blacklist or admin approval.
+    # Whitelist check
     if text:
         lowered = text.lower()
         for wl in await list_whitelist(chat.id):
             if wl in lowered:
+                log.info(f"📝 Whitelist match - keeping message")
                 return
 
-    # Keywords: Only apply to non-approved admins
-    if is_admin and not is_approved_admin and text:
+    # Blacklist check - only for non-approved admins
+    if text and not is_approved_admin:
+        lowered = text.lower()
         for kw in await list_keywords(chat.id):
             if kw in lowered:
                 try:
                     await message.delete()
-                    log.info(f"Deleted keyword '{kw}' from non-approved admin in chat {chat.id}")
+                    log.info(f"🗑️ Deleted keyword '{kw}' from non-approved admin")
                     await notify_deletion(
                         context, chat.id, chat.title or str(chat.id), sender_label,
                         f"blacklisted keyword: {kw}", text,
                     )
                     return
                 except TelegramError as e:
-                    log.warning("Couldn't delete keyword-flagged message: %s", e)
+                    log.warning(f"Couldn't delete keyword-flagged message: {e}")
                     return
 
-    # 2) admin-approval check (delete all messages from non-approved admins)
-    if not is_admin:
-        return
-    
-    if is_approved_admin:
-        return
-
+    # Delete non-approved admin messages
     delay = settings["delete_delay"]
-
     if delay <= 0:
         try:
             await message.delete()
-            log.info(
-                f"Deleted message from non-approved admin in chat {chat.id} "
-                f"(sender_id={sender_id}, @{sender_username}, name={sender_name!r})"
-            )
+            log.info(f"🗑️ Deleted message from non-approved admin")
             await notify_deletion(
                 context, chat.id, chat.title or str(chat.id), sender_label,
                 "non-approved admin", text,
             )
         except TelegramError as e:
-            log.warning("Couldn't delete message: %s", e)
+            log.warning(f"Couldn't delete message: {e}")
     else:
         context.job_queue.run_once(
             delete_job,
@@ -1622,58 +1623,58 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "snippet": text,
             },
         )
-        log.info(
-            f"Scheduled deletion for non-approved admin message in chat {chat.id} "
-            f"(delay: {delay}s, sender_id={sender_id}, @{sender_username}, name={sender_name!r})"
-        )
+        log.info(f"⏰ Scheduled deletion for non-approved admin (delay: {delay}s)")
 
 
 async def delete_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
     chat_id = data["chat_id"]
 
-    # Re-check approval right before deleting — the sender may have been
-    # approved (by tap or by username) any time during the delay window,
-    # and that approval must cancel this pending deletion.
+    # Re-check approval right before deleting
+    approved = False
+
     if data.get("signature"):
+        # For channel posts, check by signature
         approved = await is_signature_approved(chat_id, data["signature"])
+        if approved:
+            log.info(f"⏭️ Scheduled delete skipped — signature was approved during delay")
+            return
     else:
+        # For regular users, check by user_id, username, or name
         approved, _method = await is_approved_multi(
             chat_id, data.get("sender_id"), data.get("sender_username"), data.get("sender_name")
         )
-
-    if approved:
-        log.info(
-            f"Scheduled delete skipped for chat {chat_id} — sender was approved "
-            f"during the delay window (sender_id={data.get('sender_id')}, "
-            f"@{data.get('sender_username')})"
-        )
-        return
+        if approved:
+            log.info(f"⏭️ Scheduled delete skipped — user was approved during delay")
+            return
 
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=data["message_id"])
-        log.info(f"Scheduled deletion executed for chat {chat_id}")
-        sender_username = data.get("sender_username")
+        log.info(f"✅ Scheduled deletion executed for chat {chat_id}")
+        # Build sender label for notification
         sender_name = data.get("sender_name")
+        sender_username = data.get("sender_username")
         parts_label = []
         if sender_name:
             parts_label.append(sender_name)
         if sender_username:
             parts_label.append(f"@{sender_username}")
-        parts_label.append(f"ID: {data.get('sender_id')}")
+        if data.get("signature"):
+            parts_label.append(f"Signature: {data['signature']}")
+        if data.get("sender_id"):
+            parts_label.append(f"ID: {data['sender_id']}")
         sender_label = " / ".join(parts_label)
         await notify_deletion(
             context, chat_id, data.get("chat_title", str(chat_id)), sender_label,
             "non-approved admin", data.get("snippet", ""),
         )
     except TelegramError as e:
-        log.info("Scheduled delete skipped (%s)", e)
+        log.info(f"⏭️ Scheduled delete skipped ({e})")
 
 
 async def notify_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat_title: str,
                            sender_label: str, reason: str, snippet: str):
-    """DM every subscriber (users who toggled 'Delete Notifications' ON for
-    this chat) that a message was removed, and why."""
+    """DM every subscriber that a message was deleted."""
     subscribers = await list_notify_subscribers(chat_id)
     if not subscribers:
         return
@@ -1695,12 +1696,11 @@ async def notify_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat
         try:
             await context.bot.send_message(user_id, text, parse_mode=ParseMode.MARKDOWN)
         except TelegramError as e:
-            # Most likely the user never started a DM with the bot — nothing to do.
             log.info(f"Couldn't DM delete-notification to {user_id}: {e}")
 
 
 # --------------------------------------------------------------------------
-# Keep-alive web server (uptime pingers / host health checks)
+# Keep-alive web server
 # --------------------------------------------------------------------------
 
 _start_time = time.time()
@@ -1724,7 +1724,6 @@ async def start_keep_alive_server():
 
 
 async def list_functions_endpoint(request):
-    """Web endpoint to list all functions."""
     return web.json_response(list_all_functions())
 
 
