@@ -456,8 +456,16 @@ async def main_menu_markup(chat_id: int, in_dm: bool) -> InlineKeyboardMarkup:
 
 async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     try:
+        # Get all administrators including bots
         admins = await bot.get_chat_administrators(chat_id)
-    except TelegramError:
+        log.info(f"Found {len(admins)} admins in chat {chat_id}")
+        
+        # Log each admin for debugging
+        for admin in admins:
+            log.info(f"Admin: {admin.user.full_name} (ID: {admin.user.id}, Is Bot: {admin.user.is_bot})")
+            
+    except TelegramError as e:
+        log.error(f"Couldn't fetch admin list: {e}")
         return "Couldn't fetch admin list — is the bot an admin here?", InlineKeyboardMarkup(
             [[InlineKeyboardButton("🔙 Back", callback_data=f"menu:{chat_id}")]]
         )
@@ -466,16 +474,27 @@ async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, Inl
     bot_user = await bot.get_me()
     bot_id = bot_user.id
 
-    # Include all admins including bots and the bot itself
+    # Include ALL admins including bots and the bot itself
     admin_list = []
     for m in admins:
         is_bot = m.user.is_bot
         is_self_bot = m.user.id == bot_id
         
+        # Check if already approved
         approved = await is_approved(chat_id, m.user.id)
-        name = m.user.full_name or (f"@{m.user.username}" if m.user.username else str(m.user.id))
         
-        # Add appropriate emoji indicators
+        # Get display name - handle None values properly
+        name_parts = []
+        if m.user.full_name:
+            name_parts.append(m.user.full_name)
+        if m.user.username:
+            name_parts.append(f"@{m.user.username}")
+        if not name_parts:
+            name_parts.append(str(m.user.id))
+        
+        name = " ".join(name_parts)
+        
+        # Add emoji indicators
         if is_self_bot:
             name = f"🤖 {name} (Self)"
         elif is_bot:
@@ -487,7 +506,8 @@ async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, Inl
             "approved": approved,
             "is_bot": is_bot,
             "is_self_bot": is_self_bot,
-            "status": m.status
+            "status": m.status,
+            "custom_title": m.custom_title or ""
         })
 
     # Sort: show owner first, then self-bot, then other admins
@@ -509,11 +529,16 @@ async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, Inl
 
     rows = []
     for admin in page_admins:
+        # Build the label with status indicators
         label = f"{'✅' if admin['approved'] else '⬜'} {admin['name']}"
+        
+        # Add owner crown
         if admin['status'] == ChatMemberStatus.OWNER:
             label = f"👑 {label}"
-        if admin['is_self_bot']:
-            label = f"⭐ {label}"  # Star for self-bot
+        
+        # Add custom title if available
+        if admin['custom_title']:
+            label = f"{label} [{admin['custom_title']}]"
         
         # Disable toggling for self-bot (can't approve/unapprove itself)
         if admin['is_self_bot']:
@@ -536,12 +561,16 @@ async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, Inl
 
     rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"menu:{chat_id}")])
     
+    # Count bots and humans
+    bot_count = sum(1 for a in admin_list if a['is_bot'])
+    human_count = len(admin_list) - bot_count
+    
     text = (
         "*All Admins (Including Bots)*\n\n"
+        f"👤 Humans: {human_count} | 🤖 Bots: {bot_count} | ⭐ This bot\n\n"
         "Tap an admin to toggle approval. ✅ Approved admins' messages/posts "
         "are never auto-deleted. Anyone left ⬜ un-approved gets their "
         "messages removed after the configured timer.\n\n"
-        f"👑 Owner | 🤖 Bot | ⭐ This bot | {len(admin_list)} total admins\n\n"
         "_Note: The bot itself cannot be approved/unapproved._"
     )
     return text, InlineKeyboardMarkup(rows)
