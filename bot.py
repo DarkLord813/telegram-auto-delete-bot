@@ -1421,6 +1421,7 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1) Check if sender is an admin (for keyword filtering - applies to non-approved admins only)
     is_admin = False
     is_approved_admin = False
+    signature = None
     
     # Don't moderate the bot's own messages
     bot_user = await context.bot.get_me()
@@ -1490,7 +1491,16 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.warning("Couldn't delete message: %s", e)
     else:
         context.job_queue.run_once(
-            delete_job, when=delay, data={"chat_id": chat.id, "message_id": message.message_id}
+            delete_job,
+            when=delay,
+            data={
+                "chat_id": chat.id,
+                "message_id": message.message_id,
+                "sender_id": sender_id,
+                "sender_username": sender_username,
+                "sender_name": sender_name,
+                "signature": signature,
+            },
         )
         log.info(
             f"Scheduled deletion for non-approved admin message in chat {chat.id} "
@@ -1500,9 +1510,29 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def delete_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
+    chat_id = data["chat_id"]
+
+    # Re-check approval right before deleting — the sender may have been
+    # approved (by tap or by username) any time during the delay window,
+    # and that approval must cancel this pending deletion.
+    if data.get("signature"):
+        approved = await is_signature_approved(chat_id, data["signature"])
+    else:
+        approved, _method = await is_approved_multi(
+            chat_id, data.get("sender_id"), data.get("sender_username"), data.get("sender_name")
+        )
+
+    if approved:
+        log.info(
+            f"Scheduled delete skipped for chat {chat_id} — sender was approved "
+            f"during the delay window (sender_id={data.get('sender_id')}, "
+            f"@{data.get('sender_username')})"
+        )
+        return
+
     try:
-        await context.bot.delete_message(chat_id=data["chat_id"], message_id=data["message_id"])
-        log.info(f"Scheduled deletion executed for chat {data['chat_id']}")
+        await context.bot.delete_message(chat_id=chat_id, message_id=data["message_id"])
+        log.info(f"Scheduled deletion executed for chat {chat_id}")
     except TelegramError as e:
         log.info("Scheduled delete skipped (%s)", e)
 
