@@ -234,6 +234,44 @@ async def is_approved(chat_id: int, user_id: int) -> bool:
     return row is not None
 
 
+async def is_approved_multi(chat_id: int, user_id: int | None, username: str | None,
+                             full_name: str | None) -> tuple[bool, str]:
+    """Approval check with fallbacks: exact user_id match first (authoritative),
+    then username, then display name — so a bot/admin approved by username
+    still gets recognized even if something about live ID matching doesn't
+    line up. Returns (approved, method) for logging."""
+    if user_id is not None:
+        cur = await db.execute(
+            "SELECT 1 FROM approved_admins WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+        )
+        if await cur.fetchone():
+            await cur.close()
+            return True, "user_id"
+        await cur.close()
+
+    if username:
+        cur = await db.execute(
+            "SELECT 1 FROM approved_admins WHERE chat_id = ? AND username = ? COLLATE NOCASE",
+            (chat_id, username.lstrip("@")),
+        )
+        if await cur.fetchone():
+            await cur.close()
+            return True, "username"
+        await cur.close()
+
+    if full_name:
+        cur = await db.execute(
+            "SELECT 1 FROM approved_admins WHERE chat_id = ? AND name = ? COLLATE NOCASE",
+            (chat_id, full_name),
+        )
+        if await cur.fetchone():
+            await cur.close()
+            return True, "name"
+        await cur.close()
+
+    return False, ""
+
+
 async def toggle_approved(chat_id: int, user_id: int, name: str, username: str | None, signature: str | None, is_bot: bool = False):
     if await is_approved(chat_id, user_id):
         await db.execute(
@@ -1351,7 +1389,7 @@ async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFA
                 member.custom_title, member.user.is_bot,
             )
             kind = "bot" if member.user.is_bot else "admin"
-            await message.reply_text(f"✅ Approved @{username} ({kind}).")
+            await message.reply_text(f"✅ Approved @{username} ({kind}, ID: {resolved.id}).")
             return
 
     # --- otherwise: normal group/channel message moderation ---
@@ -1399,7 +1437,15 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Check if user is admin
         if await user_is_chat_admin(context.bot, chat.id, message.from_user.id):
             is_admin = True
-            is_approved_admin = await is_approved(chat.id, message.from_user.id)
+            is_approved_admin, method = await is_approved_multi(
+                chat.id, message.from_user.id, message.from_user.username,
+                message.from_user.full_name,
+            )
+            if is_approved_admin:
+                log.info(
+                    f"Admin {message.from_user.id} (@{message.from_user.username}) "
+                    f"approved in chat {chat.id} via {method} match"
+                )
 
     # Whitelist: if the message matches any whitelisted keyword, it's fully
     # protected — never deleted, regardless of blacklist or admin approval.
@@ -1429,17 +1475,27 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     delay = settings["delete_delay"]
+    sender_id = message.from_user.id if message.from_user else (message.sender_chat.id if message.sender_chat else None)
+    sender_username = message.from_user.username if message.from_user else None
+    sender_name = message.from_user.full_name if message.from_user else message.author_signature
+
     if delay <= 0:
         try:
             await message.delete()
-            log.info(f"Deleted message from non-approved admin in chat {chat.id}")
+            log.info(
+                f"Deleted message from non-approved admin in chat {chat.id} "
+                f"(sender_id={sender_id}, @{sender_username}, name={sender_name!r})"
+            )
         except TelegramError as e:
             log.warning("Couldn't delete message: %s", e)
     else:
         context.job_queue.run_once(
             delete_job, when=delay, data={"chat_id": chat.id, "message_id": message.message_id}
         )
-        log.info(f"Scheduled deletion for non-approved admin message in chat {chat.id} (delay: {delay}s)")
+        log.info(
+            f"Scheduled deletion for non-approved admin message in chat {chat.id} "
+            f"(delay: {delay}s, sender_id={sender_id}, @{sender_username}, name={sender_name!r})"
+        )
 
 
 async def delete_job(context: ContextTypes.DEFAULT_TYPE):
