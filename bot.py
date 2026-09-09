@@ -80,8 +80,9 @@ CREATE TABLE IF NOT EXISTS chats (
     type         TEXT,
     delete_delay INTEGER NOT NULL DEFAULT 300,
     force_join   INTEGER NOT NULL DEFAULT 1,
-    enabled      INTEGER NOT NULL DEFAULT 1,
-    bot_is_admin INTEGER NOT NULL DEFAULT 1
+    enabled      INTEGER NOT NULL DEFAULT 0,
+    bot_is_admin INTEGER NOT NULL DEFAULT 1,
+    managing_started INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS approved_admins (
@@ -97,6 +98,12 @@ CREATE TABLE IF NOT EXISTS banned_keywords (
     chat_id INTEGER NOT NULL,
     keyword TEXT NOT NULL COLLATE NOCASE,
     PRIMARY KEY (chat_id, keyword)
+);
+
+CREATE TABLE IF NOT EXISTS removed_chats (
+    chat_id INTEGER PRIMARY KEY,
+    removed_at INTEGER,
+    reason TEXT
 );
 """
 
@@ -114,8 +121,8 @@ async def init_db():
 
 async def ensure_chat(chat_id: int, title: str | None = None, chat_type: str | None = None):
     await db.execute(
-        "INSERT OR IGNORE INTO chats (chat_id, title, type, delete_delay) VALUES (?, ?, ?, ?)",
-        (chat_id, title, chat_type, DEFAULT_DELETE_DELAY),
+        "INSERT OR IGNORE INTO chats (chat_id, title, type, delete_delay, enabled, managing_started) VALUES (?, ?, ?, ?, ?, ?)",
+        (chat_id, title, chat_type, DEFAULT_DELETE_DELAY, 0, 0),
     )
     if title:
         await db.execute("UPDATE chats SET title = ? WHERE chat_id = ?", (title, chat_id))
@@ -145,11 +152,16 @@ async def list_known_chats() -> list[tuple[int, str, str]]:
 async def get_settings(chat_id: int) -> dict:
     await ensure_chat(chat_id)
     cur = await db.execute(
-        "SELECT delete_delay, force_join, enabled FROM chats WHERE chat_id = ?", (chat_id,)
+        "SELECT delete_delay, force_join, enabled, managing_started FROM chats WHERE chat_id = ?", (chat_id,)
     )
     row = await cur.fetchone()
     await cur.close()
-    return {"delete_delay": row[0], "force_join": bool(row[1]), "enabled": bool(row[2])}
+    return {
+        "delete_delay": row[0], 
+        "force_join": bool(row[1]), 
+        "enabled": bool(row[2]),
+        "managing_started": bool(row[3])
+    }
 
 
 async def set_delete_delay(chat_id: int, seconds: int):
@@ -174,6 +186,21 @@ async def toggle_enabled(chat_id: int) -> bool:
     await db.execute("UPDATE chats SET enabled = ? WHERE chat_id = ?", (int(new_val), chat_id))
     await db.commit()
     return new_val
+
+
+async def start_managing(chat_id: int) -> bool:
+    """Start managing a chat - enables auto-delete and marks as started."""
+    await db.execute(
+        "UPDATE chats SET enabled = 1, managing_started = 1 WHERE chat_id = ?", (chat_id,)
+    )
+    await db.commit()
+    return True
+
+
+async def is_managing_started(chat_id: int) -> bool:
+    """Check if managing has been started for this chat."""
+    s = await get_settings(chat_id)
+    return s["managing_started"]
 
 
 async def is_approved(chat_id: int, user_id: int) -> bool:
@@ -249,6 +276,44 @@ async def init_default_keywords(chat_id: int):
             await add_keyword(chat_id, kw)
 
 
+async def remove_chat_from_management(chat_id: int, reason: str = "User removed"):
+    """Remove a chat from the bot's management list."""
+    await db.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
+    await db.execute("DELETE FROM approved_admins WHERE chat_id = ?", (chat_id,))
+    await db.execute("DELETE FROM banned_keywords WHERE chat_id = ?", (chat_id,))
+    await db.execute(
+        "INSERT OR REPLACE INTO removed_chats (chat_id, removed_at, reason) VALUES (?, ?, ?)",
+        (chat_id, int(time.time()), reason)
+    )
+    await db.commit()
+    log.info(f"Chat {chat_id} removed from management. Reason: {reason}")
+
+
+async def is_chat_removed(chat_id: int) -> bool:
+    """Check if a chat has been removed from management."""
+    cur = await db.execute("SELECT 1 FROM removed_chats WHERE chat_id = ?", (chat_id,))
+    row = await cur.fetchone()
+    await cur.close()
+    return row is not None
+
+
+async def restore_chat(chat_id: int):
+    """Restore a previously removed chat."""
+    await db.execute("DELETE FROM removed_chats WHERE chat_id = ?", (chat_id,))
+    await db.commit()
+    log.info(f"Chat {chat_id} restored to management")
+
+
+async def list_removed_chats() -> list[tuple[int, str, int]]:
+    """List all removed chats."""
+    cur = await db.execute(
+        "SELECT chat_id, reason, removed_at FROM removed_chats ORDER BY removed_at DESC"
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    return rows
+
+
 # --------------------------------------------------------------------------
 # Function listing utility
 # --------------------------------------------------------------------------
@@ -283,13 +348,16 @@ def list_all_functions() -> Dict[str, List[Dict[str, Any]]]:
                                "get_settings", "set_delete_delay", "toggle_force_join",
                                "toggle_enabled", "is_approved", "toggle_approved",
                                "is_signature_approved", "list_keywords", "add_keyword",
-                               "remove_keyword_by_index", "init_default_keywords")):
+                               "remove_keyword_by_index", "init_default_keywords",
+                               "remove_chat_from_management", "is_chat_removed", 
+                               "restore_chat", "list_removed_chats", "start_managing",
+                               "is_managing_started")):
                 functions["Database Operations"].append(func_info)
             elif name in ("user_is_chat_admin", "user_joined_force_channel", 
                          "force_join_keyboard", "fmt_delay"):
                 functions["Telegram Helpers"].append(func_info)
             elif name in ("main_menu_markup", "admins_menu_markup", "timer_menu_markup",
-                         "keywords_menu_markup", "build_chat_picker"):
+                         "keywords_menu_markup", "build_chat_picker", "removed_chats_markup"):
                 functions["UI/Menu Builders"].append(func_info)
             elif name in ("start_cmd", "callback_router", "text_and_moderation_handler"):
                 functions["Command Handlers"].append(func_info)
@@ -297,7 +365,7 @@ def list_all_functions() -> Dict[str, List[Dict[str, Any]]]:
                 functions["Moderation"].append(func_info)
             elif name in ("list_all_functions",):
                 functions["Utility"].append(func_info)
-            elif name in ("_keep_alive_root", "start_keep_alive_server"):
+            elif name in ("_keep_alive_root", "start_keep_alive_server", "list_functions_endpoint"):
                 functions["Web Server"].append(func_info)
             elif name == "main":
                 functions["Entrypoint"].append(func_info)
@@ -326,8 +394,6 @@ async def user_joined_force_channel(bot, user_id: int) -> bool:
             ChatMemberStatus.OWNER,
         )
     except TelegramError as e:
-        # Bot probably isn't admin in the force-join channel yet — fail open
-        # so a misconfiguration doesn't lock everyone out, but log loudly.
         log.warning("Force-join check failed (%s) — allowing through", e)
         return True
 
@@ -357,19 +423,31 @@ def fmt_delay(seconds: int) -> str:
 
 async def main_menu_markup(chat_id: int, in_dm: bool) -> InlineKeyboardMarkup:
     s = await get_settings(chat_id)
-    rows = [
-        [InlineKeyboardButton("👮 Approved Admins", callback_data=f"adm:{chat_id}")],
-        [InlineKeyboardButton(f"⏱ Deletion Timer ({fmt_delay(s['delete_delay'])})",
-                               callback_data=f"tmr:{chat_id}")],
-        [InlineKeyboardButton("🚫 Banned Keywords", callback_data=f"kw:{chat_id}")],
-        [InlineKeyboardButton(
+    rows = []
+    
+    # Show Start Managing button if not started
+    if not s["managing_started"]:
+        rows.append([InlineKeyboardButton("🚀 START MANAGING", callback_data=f"start_mgmt:{chat_id}")])
+        rows.append([InlineKeyboardButton("ℹ️ Setup Required", callback_data="noop")])
+    
+    rows.append([InlineKeyboardButton("👮 Approved Admins", callback_data=f"adm:{chat_id}")])
+    rows.append([InlineKeyboardButton(f"⏱ Deletion Timer ({fmt_delay(s['delete_delay'])})",
+                               callback_data=f"tmr:{chat_id}")])
+    rows.append([InlineKeyboardButton("🚫 Banned Keywords", callback_data=f"kw:{chat_id}")])
+    
+    # Only show toggle buttons if managing has started
+    if s["managing_started"]:
+        rows.append([InlineKeyboardButton(
             f"{'🟢' if s['enabled'] else '🔴'} Auto-Delete: {'ON' if s['enabled'] else 'OFF'}",
-            callback_data=f"te:{chat_id}")],
-        [InlineKeyboardButton(
+            callback_data=f"te:{chat_id}")])
+        rows.append([InlineKeyboardButton(
             f"{'🟢' if s['force_join'] else '🔴'} Force-Join: {'ON' if s['force_join'] else 'OFF'}",
-            callback_data=f"tf:{chat_id}")],
-    ]
+            callback_data=f"tf:{chat_id}")])
+    else:
+        rows.append([InlineKeyboardButton("⏳ Waiting for Start", callback_data="noop")])
+    
     if in_dm:
+        rows.append([InlineKeyboardButton("🗑 Remove Chat", callback_data=f"rm:{chat_id}")])
         rows.append([InlineKeyboardButton("🔙 My Chats", callback_data="chats")])
     else:
         rows.append([InlineKeyboardButton("❌ Close", callback_data=f"close:{chat_id}")])
@@ -470,16 +548,30 @@ async def keywords_menu_markup(chat_id: int) -> tuple[str, InlineKeyboardMarkup]
 
 async def build_chat_picker(bot, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     known = await list_known_chats()
+    removed = await list_removed_chats()
+    removed_ids = [r[0] for r in removed]
+    
     rows = []
     for chat_id, title, ctype in known:
+        if chat_id in removed_ids:
+            continue
         if await user_is_chat_admin(bot, chat_id, user_id):
             icon = "📢" if ctype == ChatType.CHANNEL else "👥"
+            managing_started = await is_managing_started(chat_id)
+            status = "✅" if managing_started else "⏳"
             rows.append(
-                [InlineKeyboardButton(f"{icon} {title or chat_id}", callback_data=f"sel:{chat_id}")]
+                [InlineKeyboardButton(f"{icon} {status} {title or chat_id}", callback_data=f"sel:{chat_id}")]
             )
+    
+    # Add removed chats section if any
+    if removed:
+        rows.append([InlineKeyboardButton("—" * 20, callback_data="noop")])
+        rows.append([InlineKeyboardButton("🗑 Removed Chats", callback_data="removed_list")])
+    
     rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="chats")])
+    
     if rows[:-1]:
-        text = "*Your Chats*\n\nPick a group or channel to manage:"
+        text = "*Your Chats*\n\nPick a group or channel to manage:\n✅ = Managing active | ⏳ = Setup pending"
     else:
         text = (
             "*Your Chats*\n\n"
@@ -488,6 +580,34 @@ async def build_chat_picker(bot, user_id: int) -> tuple[str, InlineKeyboardMarku
             "_If you added me before, promote/demote me once so I re-register "
             "the chat._"
         )
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def removed_chats_markup() -> tuple[str, InlineKeyboardMarkup]:
+    removed = await list_removed_chats()
+    if not removed:
+        return "*Removed Chats*\n\nNo chats have been removed.", InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔙 Back", callback_data="chats")]]
+        )
+    
+    rows = []
+    for chat_id, reason, removed_at in removed:
+        time_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(removed_at))
+        rows.append([
+            InlineKeyboardButton(
+                f"🔄 Restore {chat_id}", 
+                callback_data=f"restore:{chat_id}"
+            )
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                f"  📝 {reason[:30]} ({time_str})", 
+                callback_data="noop"
+            )
+        ])
+    
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="chats")])
+    text = "*🗑 Removed Chats*\n\nTap 'Restore' to add a chat back to management."
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -500,7 +620,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
 
     if user is None:
-        # Channel post with no attributable sender — nothing we can do.
         return
 
     joined = await user_joined_force_channel(context.bot, user.id)
@@ -512,26 +631,39 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if chat.type == ChatType.PRIVATE:
-        text, markup_rows = (
+        text = (
             "👋 *Admin Auto-Delete Bot*\n\n"
             "I remove posts from group/channel admins who aren't on your "
             "approved list, after a timer you set (default 5 minutes). I "
             "can also auto-delete messages containing banned keywords, "
             "from anyone.\n\n"
-            "Add me to a group or channel and promote me to admin (with "
-            "*Delete Messages* permission). Manage everything from here.",
-            None,
+            "**To add me to a group or channel:**\n"
+            "1. Tap the button below\n"
+            "2. Select 'Add to Group' or 'Add to Channel'\n"
+            "3. Choose your chat\n"
+            "4. Make me an admin with 'Delete Messages' permission\n\n"
+            "**After adding:**\n"
+            "• Go to 'My Chats' in this DM\n"
+            "• Select your chat\n"
+            "• Configure settings\n"
+            "• Tap 'START MANAGING' to begin"
         )
         picker_text, picker_markup = await build_chat_picker(context.bot, user.id)
+        
+        # Send the main message with add buttons for both groups and channels
         await update.effective_message.reply_text(
             text,
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton(
-                    "➕ Add me to a group/channel",
-                    url=f"https://t.me/{context.bot.username}?startgroup=true",
-                )]]
-            ),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "➕ Add to Group", 
+                    url=f"https://t.me/{context.bot.username}?startgroup=true"
+                )],
+                [InlineKeyboardButton(
+                    "📢 Add to Channel",
+                    url=f"https://t.me/{context.bot.username}?startchannel=true"
+                )],
+            ])
         )
         await update.effective_message.reply_text(
             picker_text, parse_mode=ParseMode.MARKDOWN, reply_markup=picker_markup
@@ -539,8 +671,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Groups, supergroups, and channels: no in-chat interaction at all.
-    # Settings only ever open in a private DM with the bot — here we just
-    # quietly clean up the stray /start so it doesn't clutter the chat.
     try:
         await update.effective_message.delete()
     except TelegramError:
@@ -558,6 +688,11 @@ async def my_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
         return
     new_status = result.new_chat_member.status
     is_admin_now = new_status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    
+    # Check if chat was removed - if so, restore it when bot becomes admin again
+    if is_admin_now and await is_chat_removed(chat.id):
+        await restore_chat(chat.id)
+    
     await mark_bot_admin(chat.id, chat.title, chat.type, is_admin_now)
     
     # Initialize default keywords when bot is first added
@@ -572,7 +707,7 @@ async def my_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
-    reply_chat = update.effective_chat   # chat the button message lives in
+    reply_chat = update.effective_chat
     user = update.effective_user
 
     if data == "check_join":
@@ -584,6 +719,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if user is None:
+        await query.answer()
+        return
+
+    if data == "noop":
         await query.answer()
         return
 
@@ -605,6 +744,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
         return
 
+    if data == "removed_list":
+        await query.answer()
+        text, markup = await removed_chats_markup()
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        return
+
     parts = data.split(":")
     action = parts[0]
     in_dm = reply_chat.type == ChatType.PRIVATE
@@ -619,10 +764,19 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             info = await context.bot.get_chat(target_chat_id)
             title = info.title or str(target_chat_id)
+            chat_type = info.type
         except TelegramError:
             title = str(target_chat_id)
+            chat_type = "Unknown"
+        
+        managing_started = await is_managing_started(target_chat_id)
+        status_text = "✅ Active" if managing_started else "⏳ Setup Required"
+        
         await query.edit_message_text(
-            f"⚙️ *Managing:* {title}",
+            f"⚙️ *Managing:* {title}\n"
+            f"📋 Type: {chat_type}\n"
+            f"📊 Status: {status_text}\n\n"
+            f"{'⚠️ Tap START MANAGING to begin auto-deletion' if not managing_started else '⚙️ Configure settings below'}",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=await main_menu_markup(target_chat_id, in_dm=True),
         )
@@ -639,6 +793,18 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await query.answer()
+
+    # Handle Start Managing action
+    if action == "start_mgmt":
+        await start_managing(target_chat_id)
+        await query.edit_message_text(
+            f"✅ *Managing Started!*\n\n"
+            f"Auto-delete is now active for this chat.\n"
+            f"Configure settings below.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=await main_menu_markup(target_chat_id, in_dm),
+        )
+        return
 
     if action == "menu":
         await query.edit_message_text(
@@ -732,6 +898,70 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=await main_menu_markup(target_chat_id, in_dm),
         )
 
+    elif action == "rm":  # remove chat
+        await query.edit_message_text(
+            f"⚠️ *Remove Chat*\n\n"
+            f"Are you sure you want to remove this chat from management?\n\n"
+            f"This will:\n"
+            f"• Stop all auto-deletion\n"
+            f"• Remove all approved admins\n"
+            f"• Remove all banned keywords\n\n"
+            f"To restore, simply re-add the bot as admin.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, Remove", callback_data=f"rm_confirm:{target_chat_id}")],
+                [InlineKeyboardButton("❌ Cancel", callback_data=f"menu:{target_chat_id}")]
+            ])
+        )
+    
+    elif action == "rm_confirm":  # confirm removal
+        await remove_chat_from_management(target_chat_id, "Removed by user")
+        await query.edit_message_text(
+            f"✅ Chat has been removed from management.\n\n"
+            f"You can restore it by adding the bot as admin again.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back to Chats", callback_data="chats")]
+            ])
+        )
+
+    elif action == "restore":  # restore removed chat
+        chat_id_to_restore = target_chat_id
+        await restore_chat(chat_id_to_restore)
+        try:
+            bot_member = await context.bot.get_chat_member(chat_id_to_restore, context.bot.id)
+            if bot_member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+                await mark_bot_admin(chat_id_to_restore, None, None, True)
+                await init_default_keywords(chat_id_to_restore)
+                await query.edit_message_text(
+                    f"✅ Chat {chat_id_to_restore} has been restored!\n\n"
+                    f"The bot is still an admin. Configure settings and tap START MANAGING.",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔙 Back to Chats", callback_data="chats")]
+                    ])
+                )
+            else:
+                await query.edit_message_text(
+                    f"⚠️ Chat {chat_id_to_restore} has been restored to the database,\n"
+                    f"but the bot is no longer an admin there.\n\n"
+                    f"Please add the bot as admin again for it to work.",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔙 Back to Chats", callback_data="chats")]
+                    ])
+                )
+        except TelegramError:
+            await query.edit_message_text(
+                f"⚠️ Chat {chat_id_to_restore} has been restored,\n"
+                f"but the bot couldn't verify admin status.\n\n"
+                f"Please add the bot as admin again.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back to Chats", callback_data="chats")]
+                ])
+            )
+
     elif action == "close":
         if in_dm:
             text, markup = await build_chat_picker(context.bot, user.id)
@@ -756,8 +986,7 @@ async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFA
 
     key = (chat.id, user.id) if user else None
 
-    # --- pending "type a value" flow from an admin menu (always in a
-    # regular chat with a real user — DM or the group itself) ---
+    # --- pending "type a value" flow from an admin menu ---
     if key and key in PENDING_INPUT:
         action, target_chat_id = PENDING_INPUT.pop(key)
         text = (message.text or "").strip()
@@ -797,6 +1026,14 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     chat = update.effective_chat
     if message is None or chat.type not in MANAGEABLE_TYPES:
+        return
+
+    # Check if chat has been removed
+    if await is_chat_removed(chat.id):
+        return
+
+    # Check if managing has been started
+    if not await is_managing_started(chat.id):
         return
 
     settings = await get_settings(chat.id)
@@ -904,7 +1141,6 @@ async def main():
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CallbackQueryHandler(callback_router))
     application.add_handler(ChatMemberHandler(my_chat_member_update, ChatMemberHandler.MY_CHAT_MEMBER))
-    # Any non-command message: pending-input capture, else group/channel moderation.
     application.add_handler(
         MessageHandler(filters.ALL & ~filters.COMMAND, text_and_moderation_handler)
     )
@@ -919,7 +1155,7 @@ async def main():
 
         log.info("Bot is up.")
         try:
-            await asyncio.Event().wait()  # run forever
+            await asyncio.Event().wait()
         finally:
             if keep_alive_runner:
                 await keep_alive_runner.cleanup()
@@ -929,4 +1165,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main())p
