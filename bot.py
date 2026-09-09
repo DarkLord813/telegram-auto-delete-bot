@@ -456,13 +456,13 @@ async def main_menu_markup(chat_id: int, in_dm: bool) -> InlineKeyboardMarkup:
 
 async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     try:
-        # Get all administrators including bots
+        # First, try to get admins
         admins = await bot.get_chat_administrators(chat_id)
         log.info(f"Found {len(admins)} admins in chat {chat_id}")
         
         # Log each admin for debugging
         for admin in admins:
-            log.info(f"Admin: {admin.user.full_name} (ID: {admin.user.id}, Is Bot: {admin.user.is_bot})")
+            log.info(f"Admin: {admin.user.full_name} (ID: {admin.user.id}, Is Bot: {admin.user.is_bot}, Status: {admin.status})")
             
     except TelegramError as e:
         log.error(f"Couldn't fetch admin list: {e}")
@@ -509,6 +509,14 @@ async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, Inl
             "status": m.status,
             "custom_title": m.custom_title or ""
         })
+
+    # If no admins found, try to get the chat info directly
+    if not admin_list:
+        try:
+            chat_info = await bot.get_chat(chat_id)
+            log.info(f"Chat info: {chat_info}")
+        except Exception as e:
+            log.error(f"Could not get chat info: {e}")
 
     # Sort: show owner first, then self-bot, then other admins
     admin_list.sort(key=lambda x: (
