@@ -3,7 +3,7 @@ import logging
 import os
 import time
 import inspect
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import aiosqlite
 from aiohttp import web
@@ -12,6 +12,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
+    ChatMember,
 )
 from telegram.constants import ChatType, ChatMemberStatus, ParseMode
 from telegram.error import TelegramError
@@ -67,8 +68,7 @@ DEFAULT_BANNED_KEYWORDS = [
 
 MANAGEABLE_TYPES = (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL)
 
-# in-memory state for "waiting on a free-text reply" flows (custom timer / add keyword)
-# key: (reply_chat_id, user_id) -> (action, target_chat_id)
+# in-memory state for "waiting on a free-text reply" flows
 PENDING_INPUT: dict[tuple[int, int], tuple[str, int]] = {}
 
 db: aiosqlite.Connection | None = None
@@ -89,8 +89,10 @@ CREATE TABLE IF NOT EXISTS approved_admins (
     chat_id   INTEGER NOT NULL,
     user_id   INTEGER NOT NULL,
     name      TEXT,
+    username  TEXT,
     signature TEXT,
     is_bot    INTEGER DEFAULT 0,
+    admin_type TEXT DEFAULT 'member',
     PRIMARY KEY (chat_id, user_id)
 );
 
@@ -105,6 +107,17 @@ CREATE TABLE IF NOT EXISTS removed_chats (
     removed_at INTEGER,
     reason TEXT
 );
+
+CREATE TABLE IF NOT EXISTS all_admins (
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    name TEXT,
+    username TEXT,
+    is_bot INTEGER DEFAULT 0,
+    status TEXT,
+    last_updated INTEGER,
+    PRIMARY KEY (chat_id, user_id)
+);
 """
 
 
@@ -117,6 +130,7 @@ async def init_db():
     db = await aiosqlite.connect(DATABASE_PATH)
     await db.executescript(SCHEMA)
     await db.commit()
+    log.info("Database initialized")
 
 
 async def ensure_chat(chat_id: int, title: str | None = None, chat_type: str | None = None):
@@ -212,16 +226,16 @@ async def is_approved(chat_id: int, user_id: int) -> bool:
     return row is not None
 
 
-async def toggle_approved(chat_id: int, user_id: int, name: str, signature: str | None, is_bot: bool = False):
+async def toggle_approved(chat_id: int, user_id: int, name: str, username: str | None, signature: str | None, is_bot: bool = False):
     if await is_approved(chat_id, user_id):
         await db.execute(
             "DELETE FROM approved_admins WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
         )
     else:
         await db.execute(
-            "INSERT OR REPLACE INTO approved_admins (chat_id, user_id, name, signature, is_bot) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (chat_id, user_id, name, signature, int(is_bot)),
+            "INSERT OR REPLACE INTO approved_admins (chat_id, user_id, name, username, signature, is_bot) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (chat_id, user_id, name, username, signature, int(is_bot)),
         )
     await db.commit()
 
@@ -281,6 +295,7 @@ async def remove_chat_from_management(chat_id: int, reason: str = "User removed"
     await db.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
     await db.execute("DELETE FROM approved_admins WHERE chat_id = ?", (chat_id,))
     await db.execute("DELETE FROM banned_keywords WHERE chat_id = ?", (chat_id,))
+    await db.execute("DELETE FROM all_admins WHERE chat_id = ?", (chat_id,))
     await db.execute(
         "INSERT OR REPLACE INTO removed_chats (chat_id, removed_at, reason) VALUES (?, ?, ?)",
         (chat_id, int(time.time()), reason)
@@ -312,6 +327,47 @@ async def list_removed_chats() -> list[tuple[int, str, int]]:
     rows = await cur.fetchall()
     await cur.close()
     return rows
+
+
+async def store_all_admins(chat_id: int, admins: List[ChatMember]):
+    """Store all admins in the database for better tracking."""
+    for admin in admins:
+        await db.execute(
+            """INSERT OR REPLACE INTO all_admins 
+               (chat_id, user_id, name, username, is_bot, status, last_updated) 
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                chat_id,
+                admin.user.id,
+                admin.user.full_name or admin.user.username or str(admin.user.id),
+                admin.user.username,
+                int(admin.user.is_bot),
+                admin.status,
+                int(time.time())
+            )
+        )
+    await db.commit()
+    log.info(f"Stored {len(admins)} admins for chat {chat_id}")
+
+
+async def get_all_admins(chat_id: int) -> list[dict]:
+    """Get all stored admins for a chat."""
+    cur = await db.execute(
+        "SELECT user_id, name, username, is_bot, status FROM all_admins WHERE chat_id = ?",
+        (chat_id,)
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    return [
+        {
+            "user_id": row[0],
+            "name": row[1],
+            "username": row[2],
+            "is_bot": bool(row[3]),
+            "status": row[4]
+        }
+        for row in rows
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -351,7 +407,7 @@ def list_all_functions() -> Dict[str, List[Dict[str, Any]]]:
                                "remove_keyword_by_index", "init_default_keywords",
                                "remove_chat_from_management", "is_chat_removed", 
                                "restore_chat", "list_removed_chats", "start_managing",
-                               "is_managing_started")):
+                               "is_managing_started", "store_all_admins", "get_all_admins")):
                 functions["Database Operations"].append(func_info)
             elif name in ("user_is_chat_admin", "user_joined_force_channel", 
                          "force_join_keyboard", "fmt_delay"):
@@ -447,6 +503,7 @@ async def main_menu_markup(chat_id: int, in_dm: bool) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton("⏳ Waiting for Start", callback_data="noop")])
     
     if in_dm:
+        rows.append([InlineKeyboardButton("🔄 Refresh Admins", callback_data=f"refresh_admins:{chat_id}")])
         rows.append([InlineKeyboardButton("🗑 Remove Chat", callback_data=f"rm:{chat_id}")])
         rows.append([InlineKeyboardButton("🔙 My Chats", callback_data="chats")])
     else:
@@ -456,19 +513,41 @@ async def main_menu_markup(chat_id: int, in_dm: bool) -> InlineKeyboardMarkup:
 
 async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     try:
-        # First, try to get admins
+        # Get admins from Telegram API
         admins = await bot.get_chat_administrators(chat_id)
-        log.info(f"Found {len(admins)} admins in chat {chat_id}")
+        log.info(f"Found {len(admins)} admins from Telegram API for chat {chat_id}")
         
-        # Log each admin for debugging
-        for admin in admins:
-            log.info(f"Admin: {admin.user.full_name} (ID: {admin.user.id}, Is Bot: {admin.user.is_bot}, Status: {admin.status})")
-            
+        # Store all admins in database for tracking
+        await store_all_admins(chat_id, admins)
+        
     except TelegramError as e:
         log.error(f"Couldn't fetch admin list: {e}")
-        return "Couldn't fetch admin list — is the bot an admin here?", InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔙 Back", callback_data=f"menu:{chat_id}")]]
-        )
+        # Try to get from database if API fails
+        stored_admins = await get_all_admins(chat_id)
+        if stored_admins:
+            log.info(f"Using {len(stored_admins)} stored admins from database")
+            # Convert stored admins to ChatMember-like objects
+            admins = []
+            for admin in stored_admins:
+                # Create a simple object with user attribute
+                class User:
+                    def __init__(self, data):
+                        self.id = data['user_id']
+                        self.full_name = data['name']
+                        self.username = data['username']
+                        self.is_bot = data['is_bot']
+                
+                class Member:
+                    def __init__(self, data):
+                        self.user = User(data)
+                        self.status = data['status']
+                        self.custom_title = ""
+                
+                admins.append(Member(admin))
+        else:
+            return "Couldn't fetch admin list — is the bot an admin here?", InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Back", callback_data=f"menu:{chat_id}")]]
+            )
 
     # Get bot's own user ID to highlight it
     bot_user = await bot.get_me()
@@ -483,26 +562,26 @@ async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, Inl
         # Check if already approved
         approved = await is_approved(chat_id, m.user.id)
         
-        # Get display name - handle None values properly
-        name_parts = []
-        if m.user.full_name:
-            name_parts.append(m.user.full_name)
-        if m.user.username:
-            name_parts.append(f"@{m.user.username}")
-        if not name_parts:
-            name_parts.append(str(m.user.id))
+        # Get display name
+        name = m.user.full_name or str(m.user.id)
+        username = f"@{m.user.username}" if m.user.username else ""
         
-        name = " ".join(name_parts)
+        # Build display name
+        display_name = name
+        if username:
+            display_name = f"{display_name} ({username})"
         
         # Add emoji indicators
         if is_self_bot:
-            name = f"🤖 {name} (Self)"
+            display_name = f"🤖 {display_name} (Self)"
         elif is_bot:
-            name = f"🤖 {name}"
+            display_name = f"🤖 {display_name}"
         
         admin_list.append({
             "user_id": m.user.id,
-            "name": name,
+            "name": display_name,
+            "full_name": name,
+            "username": username,
             "approved": approved,
             "is_bot": is_bot,
             "is_self_bot": is_self_bot,
@@ -510,19 +589,11 @@ async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, Inl
             "custom_title": m.custom_title or ""
         })
 
-    # If no admins found, try to get the chat info directly
-    if not admin_list:
-        try:
-            chat_info = await bot.get_chat(chat_id)
-            log.info(f"Chat info: {chat_info}")
-        except Exception as e:
-            log.error(f"Could not get chat info: {e}")
-
     # Sort: show owner first, then self-bot, then other admins
     admin_list.sort(key=lambda x: (
         0 if x['status'] == ChatMemberStatus.OWNER else 1,
         0 if x['is_self_bot'] else 1,
-        x['name'].lower()
+        x['full_name'].lower()
     ))
 
     # Pagination: show 10 per page
@@ -707,7 +778,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Go to 'My Chats' in this DM\n"
             "• Select your chat\n"
             "• Configure settings\n"
-            "• Tap 'START MANAGING' to begin"
+            "• Tap 'START MANAGING' to begin\n\n"
+            "**Tip:** Use 'Refresh Admins' to update the admin list"
         )
         picker_text, picker_markup = await build_chat_picker(context.bot, user.id)
         
@@ -759,6 +831,13 @@ async def my_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
     # Initialize default keywords when bot is first added
     if is_admin_now:
         await init_default_keywords(chat.id)
+        # Fetch and store all admins immediately
+        try:
+            admins = await context.bot.get_chat_administrators(chat.id)
+            await store_all_admins(chat.id, admins)
+            log.info(f"Stored {len(admins)} admins for chat {chat.id} on bot join")
+        except Exception as e:
+            log.error(f"Failed to store admins on join: {e}")
 
 
 # --------------------------------------------------------------------------
@@ -855,9 +934,31 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
 
+    # Handle Refresh Admins action
+    if action == "refresh_admins":
+        try:
+            admins = await context.bot.get_chat_administrators(target_chat_id)
+            await store_all_admins(target_chat_id, admins)
+            await query.edit_message_text(
+                f"✅ Admins refreshed! Found {len(admins)} admins.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=await main_menu_markup(target_chat_id, in_dm),
+            )
+            log.info(f"Manually refreshed {len(admins)} admins for chat {target_chat_id}")
+            return
+        except Exception as e:
+            await query.answer(f"Error refreshing admins: {str(e)[:50]}", show_alert=True)
+            return
+
     # Handle Start Managing action
     if action == "start_mgmt":
         await start_managing(target_chat_id)
+        # Also refresh admins when starting
+        try:
+            admins = await context.bot.get_chat_administrators(target_chat_id)
+            await store_all_admins(target_chat_id, admins)
+        except Exception:
+            pass
         await query.edit_message_text(
             f"✅ *Managing Started!*\n\n"
             f"Auto-delete is now active for this chat.\n"
@@ -895,12 +996,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         try:
             member = await context.bot.get_chat_member(target_chat_id, target_user_id)
-            name = member.user.full_name or (f"@{member.user.username}" if member.user.username else str(member.user.id))
+            name = member.user.full_name or str(member.user.id)
+            username = member.user.username
             signature = member.custom_title
             is_bot = member.user.is_bot
         except TelegramError:
-            name, signature, is_bot = str(target_user_id), None, False
-        await toggle_approved(target_chat_id, target_user_id, name, signature, is_bot)
+            name, username, signature, is_bot = str(target_user_id), None, None, False
+        await toggle_approved(target_chat_id, target_user_id, name, username, signature, is_bot)
         text, markup = await admins_menu_markup(context.bot, target_chat_id, 0)
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
 
@@ -1001,6 +1103,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if bot_member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
                 await mark_bot_admin(chat_id_to_restore, None, None, True)
                 await init_default_keywords(chat_id_to_restore)
+                # Refresh admins on restore
+                try:
+                    admins = await context.bot.get_chat_administrators(chat_id_to_restore)
+                    await store_all_admins(chat_id_to_restore, admins)
+                except Exception:
+                    pass
                 await query.edit_message_text(
                     f"✅ Chat {chat_id_to_restore} has been restored!\n\n"
                     f"The bot is still an admin. Configure settings and tap START MANAGING.",
@@ -1125,7 +1233,8 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if signature:
             is_admin = True
             is_approved_admin = await is_signature_approved(chat.id, signature)
-    elif message.from_user and not message.from_user.is_bot:
+    elif message.from_user:
+        # Check if user is admin
         if await user_is_chat_admin(context.bot, chat.id, message.from_user.id):
             is_admin = True
             is_approved_admin = await is_approved(chat.id, message.from_user.id)
