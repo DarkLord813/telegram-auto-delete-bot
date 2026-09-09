@@ -462,21 +462,40 @@ async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, Inl
             [[InlineKeyboardButton("🔙 Back", callback_data=f"menu:{chat_id}")]]
         )
 
-    # Include all admins including bots
+    # Get bot's own user ID to highlight it
+    bot_user = await bot.get_me()
+    bot_id = bot_user.id
+
+    # Include all admins including bots and the bot itself
     admin_list = []
     for m in admins:
         is_bot = m.user.is_bot
+        is_self_bot = m.user.id == bot_id
+        
         approved = await is_approved(chat_id, m.user.id)
         name = m.user.full_name or (f"@{m.user.username}" if m.user.username else str(m.user.id))
-        if is_bot:
+        
+        # Add appropriate emoji indicators
+        if is_self_bot:
+            name = f"🤖 {name} (Self)"
+        elif is_bot:
             name = f"🤖 {name}"
+        
         admin_list.append({
             "user_id": m.user.id,
             "name": name,
             "approved": approved,
             "is_bot": is_bot,
+            "is_self_bot": is_self_bot,
             "status": m.status
         })
+
+    # Sort: show owner first, then self-bot, then other admins
+    admin_list.sort(key=lambda x: (
+        0 if x['status'] == ChatMemberStatus.OWNER else 1,
+        0 if x['is_self_bot'] else 1,
+        x['name'].lower()
+    ))
 
     # Pagination: show 10 per page
     ITEMS_PER_PAGE = 10
@@ -493,10 +512,17 @@ async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, Inl
         label = f"{'✅' if admin['approved'] else '⬜'} {admin['name']}"
         if admin['status'] == ChatMemberStatus.OWNER:
             label = f"👑 {label}"
-        rows.append([InlineKeyboardButton(
-            label, 
-            callback_data=f"at:{chat_id}:{admin['user_id']}"
-        )])
+        if admin['is_self_bot']:
+            label = f"⭐ {label}"  # Star for self-bot
+        
+        # Disable toggling for self-bot (can't approve/unapprove itself)
+        if admin['is_self_bot']:
+            rows.append([InlineKeyboardButton(label, callback_data="noop")])
+        else:
+            rows.append([InlineKeyboardButton(
+                label, 
+                callback_data=f"at:{chat_id}:{admin['user_id']}"
+            )])
 
     # Add pagination buttons if needed
     nav_buttons = []
@@ -515,10 +541,8 @@ async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, Inl
         "Tap an admin to toggle approval. ✅ Approved admins' messages/posts "
         "are never auto-deleted. Anyone left ⬜ un-approved gets their "
         "messages removed after the configured timer.\n\n"
-        f"👑 Owner | 🤖 Bot | {len(admin_list)} total admins\n\n"
-        "_Note: anonymous/channel posts are matched by signature (custom "
-        "title). Give each admin a distinct custom title, and make sure "
-        "\"Sign messages\" is on, or per-admin filtering can't work there._"
+        f"👑 Owner | 🤖 Bot | ⭐ This bot | {len(admin_list)} total admins\n\n"
+        "_Note: The bot itself cannot be approved/unapproved._"
     )
     return text, InlineKeyboardMarkup(rows)
 
@@ -825,6 +849,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "at":  # admin toggle: at:<chat_id>:<user_id>
         target_user_id = int(parts[2])
+        
+        # Don't allow toggling the bot itself
+        bot_user = await context.bot.get_me()
+        if target_user_id == bot_user.id:
+            await query.answer("Cannot toggle the bot itself!", show_alert=True)
+            return
+            
         try:
             member = await context.bot.get_chat_member(target_chat_id, target_user_id)
             name = member.user.full_name or (f"@{member.user.username}" if member.user.username else str(member.user.id))
@@ -1045,6 +1076,11 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1) Check if sender is an admin (for keyword filtering - applies to non-approved admins only)
     is_admin = False
     is_approved_admin = False
+    
+    # Don't moderate the bot's own messages
+    bot_user = await context.bot.get_me()
+    if message.from_user and message.from_user.id == bot_user.id:
+        return
     
     if message.sender_chat and message.sender_chat.id == chat.id:
         # Anonymous group admin or channel post
