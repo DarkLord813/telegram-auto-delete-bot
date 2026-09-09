@@ -104,6 +104,12 @@ CREATE TABLE IF NOT EXISTS banned_keywords (
     PRIMARY KEY (chat_id, keyword)
 );
 
+CREATE TABLE IF NOT EXISTS whitelist_keywords (
+    chat_id INTEGER NOT NULL,
+    keyword TEXT NOT NULL COLLATE NOCASE,
+    PRIMARY KEY (chat_id, keyword)
+);
+
 CREATE TABLE IF NOT EXISTS removed_chats (
     chat_id INTEGER PRIMARY KEY,
     removed_at INTEGER,
@@ -282,6 +288,49 @@ async def remove_keyword_by_index(chat_id: int, index: int):
             (chat_id, kws[index]),
         )
         await db.commit()
+
+
+async def list_whitelist(chat_id: int) -> list[str]:
+    cur = await db.execute(
+        "SELECT keyword FROM whitelist_keywords WHERE chat_id = ? ORDER BY keyword", (chat_id,)
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    return [r[0] for r in rows]
+
+
+async def add_whitelist_keyword(chat_id: int, keyword: str):
+    await ensure_chat(chat_id)
+    keyword = keyword.strip().lower()[:40]
+    if keyword:
+        await db.execute(
+            "INSERT OR IGNORE INTO whitelist_keywords (chat_id, keyword) VALUES (?, ?)",
+            (chat_id, keyword),
+        )
+        await db.commit()
+
+
+async def remove_whitelist_keyword_by_index(chat_id: int, index: int):
+    kws = await list_whitelist(chat_id)
+    if 0 <= index < len(kws):
+        await db.execute(
+            "DELETE FROM whitelist_keywords WHERE chat_id = ? AND keyword = ?",
+            (chat_id, kws[index]),
+        )
+        await db.commit()
+
+
+async def approve_admin(chat_id: int, user_id: int, name: str, username: str | None,
+                         signature: str | None, is_bot: bool = False):
+    """Unconditional approve (not a toggle) — used by the approve-by-username flow
+    so resubmitting the same username doesn't flip it back off."""
+    await ensure_chat(chat_id)
+    await db.execute(
+        "INSERT OR REPLACE INTO approved_admins (chat_id, user_id, name, username, signature, is_bot) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (chat_id, user_id, name, username, signature, int(is_bot)),
+    )
+    await db.commit()
 
 
 async def init_default_keywords(chat_id: int):
@@ -495,7 +544,8 @@ async def main_menu_markup(chat_id: int, in_dm: bool) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("👮 Approved Admins", callback_data=f"adm:{chat_id}")])
     rows.append([InlineKeyboardButton(f"⏱ Deletion Timer ({fmt_delay(s['delete_delay'])})",
                                callback_data=f"tmr:{chat_id}")])
-    rows.append([InlineKeyboardButton("🚫 Banned Keywords", callback_data=f"kw:{chat_id}")])
+    rows.append([InlineKeyboardButton("🚫 Blacklist", callback_data=f"kw:{chat_id}")])
+    rows.append([InlineKeyboardButton("✅ Whitelist", callback_data=f"wl:{chat_id}")])
     
     # Only show toggle buttons if managing has started
     if s["managing_started"]:
@@ -644,6 +694,7 @@ async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, Inl
             nav_buttons.append(InlineKeyboardButton("▶️", callback_data=f"ap:{chat_id}:{page+1}"))
         rows.append(nav_buttons)
 
+    rows.append([InlineKeyboardButton("➕ Approve Bot/Admin by Username", callback_data=f"aub:{chat_id}")])
     rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"menu:{chat_id}")])
     
     # Count bots and humans
@@ -656,6 +707,9 @@ async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, Inl
         "Tap an admin to toggle approval. ✅ Approved admins' messages/posts "
         "are never auto-deleted. Anyone left ⬜ un-approved gets their "
         "messages removed after the configured timer.\n\n"
+        "Not seeing a bot admin here? Use *Approve Bot/Admin by Username* "
+        "below to approve it directly — this also works for any admin "
+        "Telegram hasn't returned in the list yet.\n\n"
         "_Note: The bot itself cannot be approved/unapproved._"
     )
     return text, InlineKeyboardMarkup(rows)
@@ -688,8 +742,28 @@ async def keywords_menu_markup(chat_id: int) -> tuple[str, InlineKeyboardMarkup]
         rows.append([InlineKeyboardButton(f"❌ {kw}", callback_data=f"kd:{chat_id}:{i}")])
     rows.append([InlineKeyboardButton("➕ Add Keyword", callback_data=f"ka:{chat_id}")])
     rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"menu:{chat_id}")])
-    text = "*Banned Keywords*\n\nMessages containing any of these from non-approved admins are deleted instantly.\n\n"
-    text += ("Current: " + ", ".join(kws)) if kws else "_No keywords banned yet._"
+    text = (
+        "*🚫 Blacklist*\n\n"
+        "Messages containing any of these are deleted — unless the message "
+        "also matches a ✅ Whitelist entry, which always wins.\n\n"
+    )
+    text += ("Current: " + ", ".join(kws)) if kws else "_No blacklist keywords yet._"
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def whitelist_menu_markup(chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    kws = await list_whitelist(chat_id)
+    rows = []
+    for i, kw in enumerate(kws):
+        rows.append([InlineKeyboardButton(f"❌ {kw}", callback_data=f"wd:{chat_id}:{i}")])
+    rows.append([InlineKeyboardButton("➕ Add Keyword", callback_data=f"wa:{chat_id}")])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"menu:{chat_id}")])
+    text = (
+        "*✅ Whitelist*\n\n"
+        "Messages containing any of these are *never* deleted — this "
+        "overrides the blacklist and un-approved-admin auto-deletion alike.\n\n"
+    )
+    text += ("Current: " + ", ".join(kws)) if kws else "_No whitelist keywords yet._"
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -1067,6 +1141,36 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, markup = await keywords_menu_markup(target_chat_id)
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
 
+    elif action == "wl":  # whitelist menu
+        text, markup = await whitelist_menu_markup(target_chat_id)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+
+    elif action == "wa":  # whitelist add prompt
+        PENDING_INPUT[(reply_chat.id, user.id)] = ("add_whitelist", target_chat_id)
+        await query.edit_message_text(
+            "✏️ Send the keyword or phrase to whitelist, as a message here.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Cancel", callback_data=f"wl:{target_chat_id}")]]
+            ),
+        )
+
+    elif action == "wd":  # whitelist delete: wd:<chat_id>:<index>
+        index = int(parts[2])
+        await remove_whitelist_keyword_by_index(target_chat_id, index)
+        text, markup = await whitelist_menu_markup(target_chat_id)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+
+    elif action == "aub":  # approve bot/admin by username prompt
+        PENDING_INPUT[(reply_chat.id, user.id)] = ("approve_bot_username", target_chat_id)
+        await query.edit_message_text(
+            "✏️ Send the *username* of the bot or admin to approve (with or "
+            "without the @). It must already be an admin of the chat.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Cancel", callback_data=f"adm:{target_chat_id}")]]
+            ),
+        )
+
     elif action == "tf":  # toggle force-join
         await toggle_force_join(target_chat_id)
         await query.edit_message_text(
@@ -1199,12 +1303,55 @@ async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFA
         if action == "add_keyword":
             if text:
                 await add_keyword(target_chat_id, text)
-                await message.reply_text(f"✅ Banned keyword added: {text}")
+                await message.reply_text(f"✅ Blacklist keyword added: {text}")
             if chat.type != ChatType.PRIVATE:
                 try:
                     await message.delete()
                 except TelegramError:
                     pass
+            return
+
+        if action == "add_whitelist":
+            if text:
+                await add_whitelist_keyword(target_chat_id, text)
+                await message.reply_text(f"✅ Whitelist keyword added: {text}")
+            if chat.type != ChatType.PRIVATE:
+                try:
+                    await message.delete()
+                except TelegramError:
+                    pass
+            return
+
+        if action == "approve_bot_username":
+            username = text.lstrip("@").strip()
+            if not username:
+                await message.reply_text("Please send a valid username.")
+                return
+            try:
+                resolved = await context.bot.get_chat(f"@{username}")
+            except TelegramError:
+                await message.reply_text(f"❌ Couldn't find @{username}. Check the username and try again.")
+                return
+            try:
+                member = await context.bot.get_chat_member(target_chat_id, resolved.id)
+            except TelegramError:
+                await message.reply_text(
+                    f"❌ @{username} isn't a member of that chat, so it can't be approved."
+                )
+                return
+            if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+                await message.reply_text(
+                    f"⚠️ @{username} isn't an admin of that chat — only admins are subject to "
+                    f"filtering, so approving a non-admin has no effect. Promote it first."
+                )
+                return
+            name = member.user.full_name or username
+            await approve_admin(
+                target_chat_id, resolved.id, name, member.user.username,
+                member.custom_title, member.user.is_bot,
+            )
+            kind = "bot" if member.user.is_bot else "admin"
+            await message.reply_text(f"✅ Approved @{username} ({kind}).")
             return
 
     # --- otherwise: normal group/channel message moderation ---
@@ -1254,9 +1401,16 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_admin = True
             is_approved_admin = await is_approved(chat.id, message.from_user.id)
 
+    # Whitelist: if the message matches any whitelisted keyword, it's fully
+    # protected — never deleted, regardless of blacklist or admin approval.
+    if text:
+        lowered = text.lower()
+        for wl in await list_whitelist(chat.id):
+            if wl in lowered:
+                return
+
     # Keywords: Only apply to non-approved admins
     if is_admin and not is_approved_admin and text:
-        lowered = text.lower()
         for kw in await list_keywords(chat.id):
             if kw in lowered:
                 try:

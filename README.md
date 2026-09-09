@@ -1,73 +1,75 @@
 # Admin Auto-Delete Bot
 
-Single-file Telegram bot (`auto_delete.py`). Deletes messages/posts from **admins**
-who aren't on a chat's approved list — in groups, supergroups, *and*
-channels. Regular members are untouched. The only slash command is
-`/start`; everything else is inline buttons. **All settings live only in
-a private DM with the bot** — groups/supergroups/channels show no menus,
-replies, or prompts at all; the bot's only in-chat behavior there is
-auto-deleting messages. Every interaction is gated behind joining your
-force-join channel first — no exceptions.
+> A powerful Telegram bot that automatically deletes messages from non-approved admins in groups, supergroups, and channels.
 
-## Setup
+[![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Telegram](https://img.shields.io/badge/telegram-bot-blue.svg)](https://t.me/NCK_Dev)
 
-1. Create a bot with [@BotFather](https://t.me/BotFather), copy the token.
-2. Make the bot an **admin** of `https://t.me/NCK_Dev` (or your own force-join
-   channel) — it needs this to verify users joined.
-3. `cp .env.example .env` and fill in `BOT_TOKEN` (and `FORCE_JOIN_CHANNEL` /
-   `FORCE_JOIN_CHANNEL_LINK` if you're using a different channel).
-4. `pip install -r requirements.txt`
-5. `python bot.py`
+## 📋 Table of Contents
 
-## Using it
+- [Features](#-features)
+- [Installation](#-installation)
+- [Deployment](#-deployment)
+- [Usage Guide](#-usage-guide)
+- [Configuration](#-configuration)
+- [Database Schema](#-database-schema)
+- [Environment Variables](#-environment-variables)
+- [Troubleshooting](#-troubleshooting)
+- [Contributing](#-contributing)
+- [License](#-license)
 
-- Add the bot to your group/channel, promote it to **admin** with
-  *Delete Messages* permission.
-- DM the bot `/start` in private. It shows a picker of every group/channel
-  it's admin in where you're also an admin; tap one to open the settings
-  menu for that chat, right there in the DM.
-  - _If you added the bot as admin before this feature, promote/demote it
-    once (any status change) so it registers the chat — this uses
-    Telegram's `my_chat_member` update to build the list._
-- `/start` typed inside a group or channel does nothing but delete itself —
-  by design, there is no in-chat interaction of any kind. The bot only
-  acts in the chat itself by auto-deleting flagged messages.
-- **🔒 Force-join gate**: nothing works — not `/start`, not a single button —
-  until the user has joined the configured channel. Verified on every tap.
-- **Approved Admins**: tap admins to toggle ✅/⬜. Un-approved admins' posts
-  get auto-deleted; approved ones never do. Members are never touched.
-- **Deletion Timer**: presets or a custom number of minutes (default 5 min).
-- **Banned Keywords**: any message from anyone containing one is deleted
-  instantly.
-- Toggles for turning auto-delete or the force-join gate on/off per chat.
+## ✨ Features
 
-### Anonymous ("sign messages") admins & channels
+### 🎯 Core Functionality
 
-Group anonymous-admin posts and *all* channel posts arrive the same way:
-as the chat itself, with an optional `author_signature` — the admin's
-*custom title* if one is set, otherwise the chat's own name (which looks
-identical for every admin). Give each admin a distinct custom title and
-turn on **Sign messages** in the chat's admin settings if you want
-per-admin filtering there. If a post has no signature at all, the bot
-can't tell who sent it and deliberately leaves it alone rather than risk
-deleting everything.
+- **Admin Approval System**: Approve specific admins whose messages won't be deleted
+- **Scheduled Deletion**: Set custom deletion timers (Instant, 30s, 1m, 5m, 15m, 1h, or custom)
+- **Blacklist Keywords**: Auto-delete messages containing banned words/phrases
+- **Whitelist Keywords**: Messages matching whitelisted keywords are always protected
+- **Force-Join Gate**: Require users to join a specific channel before using the bot
+- **DM-Only Management**: All settings are configured through private DMs
 
-## Deploying with a keep-alive ping
+### 🤖 Admin Management
 
-`bot.py` runs a tiny web server (`/` and `/health`, port from `PORT`) so a
-free-tier host doesn't idle it out — point UptimeRobot / cron-job.org / your
-host's health check at it. Works out of the box on Render, Railway, Replit,
-Fly.io, etc. — just set `BOT_TOKEN` and friends as environment variables in
-the host's dashboard rather than a `.env` file.
+- **Full Admin List**: View all admins including bots and the bot itself
+- **Bulk Approval**: Approve admins directly from the list
+- **Username Approval**: Approve admins by username (useful for bots not showing in list)
+- **Refresh Admins**: Manually update the admin list
+- **Bot Self-Protection**: The bot cannot approve/unapprove itself
 
-## Environment variables
+### 📋 Content Moderation
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `BOT_TOKEN` | *(required)* | From @BotFather |
-| `FORCE_JOIN_CHANNEL` | `NCK_Dev` | Channel username (no `@`) users must join |
-| `FORCE_JOIN_CHANNEL_LINK` | `https://t.me/NCK_Dev` | Link shown on the join button |
-| `DEFAULT_DELETE_DELAY` | `300` | Seconds, default timer for new chats |
-| `DATABASE_PATH` | `bot.db` | SQLite file |
-| `KEEP_ALIVE_ENABLED` | `true` | Toggle the web server |
-| `PORT` | `8080` | Keep-alive server port |
+- **Blacklist System**: Delete messages containing flagged keywords
+- **Whitelist System**: Protect messages that match whitelisted keywords (overrides blacklist)
+- **Admin-Only Filtering**: Blacklist keywords only apply to non-approved admins
+- **Message Scheduling**: Set deletion delays per chat
+
+### 🗑️ Chat Management
+
+- **Remove Chats**: Remove chats from bot management
+- **Restore Chats**: Re-add previously removed chats
+- **Chat Status**: Visual indicators (✅ Active / ⏳ Setup Pending)
+
+### 🔧 Technical Features
+
+- **Persistent Storage**: SQLite database for all settings
+- **Keep-Alive Server**: Built-in health check endpoint
+- **Error Handling**: Graceful error recovery
+- **Async Operations**: Fast and responsive
+
+## 📦 Installation
+
+### Prerequisites
+
+- Python 3.8 or higher
+- Telegram Bot Token (get from [@BotFather](https://t.me/BotFather))
+- Git (optional)
+
+### Local Setup
+
+1. **Clone the repository**
+
+```bash
+git clone https://github.com/DarkLord813/telegram-auto-delete-bot.git
+cd telegram-auto-delete-bot
