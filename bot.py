@@ -110,6 +110,12 @@ CREATE TABLE IF NOT EXISTS whitelist_keywords (
     PRIMARY KEY (chat_id, keyword)
 );
 
+CREATE TABLE IF NOT EXISTS delete_notify_subscribers (
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, user_id)
+);
+
 CREATE TABLE IF NOT EXISTS removed_chats (
     chat_id INTEGER PRIMARY KEY,
     removed_at INTEGER,
@@ -371,6 +377,43 @@ async def approve_admin(chat_id: int, user_id: int, name: str, username: str | N
     await db.commit()
 
 
+async def is_notify_subscribed(chat_id: int, user_id: int) -> bool:
+    cur = await db.execute(
+        "SELECT 1 FROM delete_notify_subscribers WHERE chat_id = ? AND user_id = ?",
+        (chat_id, user_id),
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    return row is not None
+
+
+async def toggle_notify_subscription(chat_id: int, user_id: int) -> bool:
+    """Toggle whether this user gets DM'd when a message is deleted in this
+    chat. Returns the new state."""
+    if await is_notify_subscribed(chat_id, user_id):
+        await db.execute(
+            "DELETE FROM delete_notify_subscribers WHERE chat_id = ? AND user_id = ?",
+            (chat_id, user_id),
+        )
+        await db.commit()
+        return False
+    await db.execute(
+        "INSERT OR IGNORE INTO delete_notify_subscribers (chat_id, user_id) VALUES (?, ?)",
+        (chat_id, user_id),
+    )
+    await db.commit()
+    return True
+
+
+async def list_notify_subscribers(chat_id: int) -> list[int]:
+    cur = await db.execute(
+        "SELECT user_id FROM delete_notify_subscribers WHERE chat_id = ?", (chat_id,)
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    return [r[0] for r in rows]
+
+
 async def init_default_keywords(chat_id: int):
     """Initialize default banned keywords for a new chat."""
     existing = await list_keywords(chat_id)
@@ -570,7 +613,7 @@ def fmt_delay(seconds: int) -> str:
 # a private-chat picker)
 # --------------------------------------------------------------------------
 
-async def main_menu_markup(chat_id: int, in_dm: bool) -> InlineKeyboardMarkup:
+async def main_menu_markup(chat_id: int, in_dm: bool, user_id: int) -> InlineKeyboardMarkup:
     s = await get_settings(chat_id)
     rows = []
     
@@ -595,6 +638,11 @@ async def main_menu_markup(chat_id: int, in_dm: bool) -> InlineKeyboardMarkup:
             callback_data=f"tf:{chat_id}")])
     else:
         rows.append([InlineKeyboardButton("⏳ Waiting for Start", callback_data="noop")])
+
+    notify_on = await is_notify_subscribed(chat_id, user_id)
+    rows.append([InlineKeyboardButton(
+        f"{'🔔' if notify_on else '🔕'} Delete Notifications: {'ON' if notify_on else 'OFF'}",
+        callback_data=f"tn:{chat_id}")])
     
     if in_dm:
         rows.append([InlineKeyboardButton("🔄 Refresh Admins", callback_data=f"refresh_admins:{chat_id}")])
@@ -1045,7 +1093,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 Status: {status_text}\n\n"
             f"{'⚠️ Tap START MANAGING to begin auto-deletion' if not managing_started else '⚙️ Configure settings below'}",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=await main_menu_markup(target_chat_id, in_dm=True),
+            reply_markup=await main_menu_markup(target_chat_id, in_dm=True, user_id=user.id),
         )
         return
 
@@ -1069,7 +1117,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 f"✅ Admins refreshed! Found {len(admins)} admins.",
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=await main_menu_markup(target_chat_id, in_dm),
+                reply_markup=await main_menu_markup(target_chat_id, in_dm, user.id),
             )
             log.info(f"Manually refreshed {len(admins)} admins for chat {target_chat_id}")
             return
@@ -1091,7 +1139,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Auto-delete is now active for this chat.\n"
             f"Configure settings below.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=await main_menu_markup(target_chat_id, in_dm),
+            reply_markup=await main_menu_markup(target_chat_id, in_dm, user.id),
         )
         return
 
@@ -1099,7 +1147,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "⚙️ *Auto-Delete Settings*",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=await main_menu_markup(target_chat_id, in_dm),
+            reply_markup=await main_menu_markup(target_chat_id, in_dm, user.id),
         )
 
     elif action == "adm":
@@ -1147,7 +1195,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"✅ Deletion timer set to *{fmt_delay(seconds)}*.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=await main_menu_markup(target_chat_id, in_dm),
+            reply_markup=await main_menu_markup(target_chat_id, in_dm, user.id),
         )
 
     elif action == "tc":  # timer custom prompt
@@ -1214,7 +1262,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "⚙️ *Auto-Delete Settings*",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=await main_menu_markup(target_chat_id, in_dm),
+            reply_markup=await main_menu_markup(target_chat_id, in_dm, user.id),
         )
 
     elif action == "te":  # toggle enabled
@@ -1222,7 +1270,15 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "⚙️ *Auto-Delete Settings*",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=await main_menu_markup(target_chat_id, in_dm),
+            reply_markup=await main_menu_markup(target_chat_id, in_dm, user.id),
+        )
+
+    elif action == "tn":  # toggle delete-notifications for the viewing user
+        await toggle_notify_subscription(target_chat_id, user.id)
+        await query.edit_message_text(
+            "⚙️ *Auto-Delete Settings*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=await main_menu_markup(target_chat_id, in_dm, user.id),
         )
 
     elif action == "rm":  # remove chat
@@ -1448,6 +1504,12 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"approved in chat {chat.id} via {method} match"
                 )
 
+    # Sender identity, needed for both approval checks and any delete notification
+    sender_id = message.from_user.id if message.from_user else (message.sender_chat.id if message.sender_chat else None)
+    sender_username = message.from_user.username if message.from_user else None
+    sender_name = message.from_user.full_name if message.from_user else message.author_signature
+    sender_label = f"@{sender_username}" if sender_username else (sender_name or str(sender_id))
+
     # Whitelist: if the message matches any whitelisted keyword, it's fully
     # protected — never deleted, regardless of blacklist or admin approval.
     if text:
@@ -1463,6 +1525,10 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await message.delete()
                     log.info(f"Deleted keyword '{kw}' from non-approved admin in chat {chat.id}")
+                    await notify_deletion(
+                        context, chat.id, chat.title or str(chat.id), sender_label,
+                        f"blacklisted keyword: {kw}", text,
+                    )
                     return
                 except TelegramError as e:
                     log.warning("Couldn't delete keyword-flagged message: %s", e)
@@ -1476,9 +1542,6 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     delay = settings["delete_delay"]
-    sender_id = message.from_user.id if message.from_user else (message.sender_chat.id if message.sender_chat else None)
-    sender_username = message.from_user.username if message.from_user else None
-    sender_name = message.from_user.full_name if message.from_user else message.author_signature
 
     if delay <= 0:
         try:
@@ -1486,6 +1549,10 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.info(
                 f"Deleted message from non-approved admin in chat {chat.id} "
                 f"(sender_id={sender_id}, @{sender_username}, name={sender_name!r})"
+            )
+            await notify_deletion(
+                context, chat.id, chat.title or str(chat.id), sender_label,
+                "non-approved admin", text,
             )
         except TelegramError as e:
             log.warning("Couldn't delete message: %s", e)
@@ -1495,11 +1562,13 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             when=delay,
             data={
                 "chat_id": chat.id,
+                "chat_title": chat.title or str(chat.id),
                 "message_id": message.message_id,
                 "sender_id": sender_id,
                 "sender_username": sender_username,
                 "sender_name": sender_name,
                 "signature": signature,
+                "snippet": text,
             },
         )
         log.info(
@@ -1533,8 +1602,44 @@ async def delete_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=data["message_id"])
         log.info(f"Scheduled deletion executed for chat {chat_id}")
+        sender_username = data.get("sender_username")
+        sender_name = data.get("sender_name")
+        sender_label = f"@{sender_username}" if sender_username else (sender_name or str(data.get("sender_id")))
+        await notify_deletion(
+            context, chat_id, data.get("chat_title", str(chat_id)), sender_label,
+            "non-approved admin", data.get("snippet", ""),
+        )
     except TelegramError as e:
         log.info("Scheduled delete skipped (%s)", e)
+
+
+async def notify_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat_title: str,
+                           sender_label: str, reason: str, snippet: str):
+    """DM every subscriber (users who toggled 'Delete Notifications' ON for
+    this chat) that a message was removed, and why."""
+    subscribers = await list_notify_subscribers(chat_id)
+    if not subscribers:
+        return
+
+    snippet = (snippet or "").strip()
+    if len(snippet) > 200:
+        snippet = snippet[:200] + "…"
+
+    text = (
+        f"🗑 *Message deleted*\n\n"
+        f"*Chat:* {chat_title}\n"
+        f"*Sender:* {sender_label}\n"
+        f"*Reason:* {reason}"
+    )
+    if snippet:
+        text += f"\n*Content:* {snippet}"
+
+    for user_id in subscribers:
+        try:
+            await context.bot.send_message(user_id, text, parse_mode=ParseMode.MARKDOWN)
+        except TelegramError as e:
+            # Most likely the user never started a DM with the bot — nothing to do.
+            log.info(f"Couldn't DM delete-notification to {user_id}: {e}")
 
 
 # --------------------------------------------------------------------------
