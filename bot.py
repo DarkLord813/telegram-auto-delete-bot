@@ -4,11 +4,12 @@ import os
 import time
 import inspect
 import signal
+import threading
+import sys
 from typing import List, Dict, Any, Optional
 
 import aiosqlite
-import aiohttp
-from aiohttp import web
+from flask import Flask, request
 from dotenv import load_dotenv
 from telegram import (
     InlineKeyboardButton,
@@ -17,7 +18,7 @@ from telegram import (
     ChatMember,
 )
 from telegram.constants import ChatType, ChatMemberStatus, ParseMode
-from telegram.error import TelegramError, NetworkError, TimedOut
+from telegram.error import TelegramError, NetworkError, TimedOut, Conflict
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -29,7 +30,7 @@ from telegram.ext import (
 )
 
 # --------------------------------------------------------------------------
-# Config (all from environment)
+# Config
 # --------------------------------------------------------------------------
 
 load_dotenv()
@@ -42,6 +43,10 @@ PORT = int(os.getenv("PORT", "8080"))
 KEEP_ALIVE_ENABLED = os.getenv("KEEP_ALIVE_ENABLED", "true").lower() == "true"
 DEFAULT_DELETE_DELAY = int(os.getenv("DEFAULT_DELETE_DELAY", "300"))
 
+# Watchdog tuning
+WATCHDOG_INTERVAL = 90
+WATCHDOG_MAX_FAILURES = 3
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Set it in your environment or a .env file.")
 
@@ -51,7 +56,6 @@ logging.basicConfig(
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
-logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 log = logging.getLogger("autodelete-bot")
 
 TIMER_PRESETS = [
@@ -135,6 +139,48 @@ CREATE TABLE IF NOT EXISTS all_admins (
     PRIMARY KEY (chat_id, user_id)
 );
 """
+
+
+# ==========================================================================
+# FLASK HEALTH SERVER — runs in its own daemon thread (archive-bot style)
+# ==========================================================================
+
+health_app = Flask(__name__)
+_start_time = time.time()
+
+
+@health_app.route('/')
+@health_app.route('/health')
+@health_app.route('/health/')
+def health_check():
+    return "OK", 200
+
+
+@health_app.route('/status')
+def status_check():
+    return {
+        "status": "ok",
+        "uptime_seconds": int(time.time() - _start_time),
+    }, 200
+
+
+@health_app.errorhandler(404)
+def not_found(e):
+    if request.path.startswith('/health'):
+        return "OK", 200
+    return "Not Found", 404
+
+
+def run_health_server():
+    """Run Flask in its own thread — separate from the bot's event loop."""
+    log.info(f"✅ Health check server starting on port {PORT}")
+    health_app.run(
+        host='0.0.0.0',
+        port=PORT,
+        debug=False,
+        use_reloader=False,
+        threaded=True,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -667,9 +713,9 @@ def list_all_functions() -> Dict[str, List[Dict[str, Any]]]:
                 functions["Moderation"].append(func_info)
             elif name in ("list_all_functions",):
                 functions["Utility"].append(func_info)
-            elif name in ("_keep_alive_root", "start_keep_alive_server", "list_functions_endpoint"):
+            elif name in ("health_check", "status_check", "not_found", "run_health_server"):
                 functions["Web Server"].append(func_info)
-            elif name in ("main", "run_bot", "run_bot_with_recovery", "self_ping"):
+            elif name in ("main", "run_bot", "run_bot_with_recovery", "error_handler"):
                 functions["Entrypoint"].append(func_info)
 
     return functions
@@ -1503,7 +1549,6 @@ async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFA
             return
 
         if action == "add_keyword":
-            # Support multiple keywords: split on newlines, also handle commas
             lines = [ln.strip() for ln in raw_text.replace(",", "\n").split("\n")]
             keywords = [ln.lower() for ln in lines if ln]
             if keywords:
@@ -1556,7 +1601,6 @@ async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFA
             return
 
         if action == "approve_bot_username":
-            # Support multiple usernames: split on newlines, also handle commas
             lines = [ln.strip() for ln in raw_text.replace(",", "\n").split("\n")]
             usernames = [ln.lstrip("@").strip() for ln in lines if ln]
             if not usernames:
@@ -1567,14 +1611,12 @@ async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFA
             failed = []
 
             for username in usernames:
-                # Fetch user info from Telegram
                 try:
                     resolved = await context.bot.get_chat(f"@{username}")
                 except TelegramError:
                     failed.append(f"❌ @{username} — not found")
                     continue
 
-                # Check if user is a member of the chat
                 try:
                     member = await context.bot.get_chat_member(target_chat_id, resolved.id)
                 except TelegramError:
@@ -1585,12 +1627,10 @@ async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFA
                     failed.append(f"⚠️ @{username} — not an admin")
                     continue
 
-                # Get display name and signature
                 display_name = member.user.full_name or username
                 custom_title = member.custom_title
                 signature = custom_title or display_name
 
-                # Store approval
                 await approve_admin(
                     target_chat_id,
                     resolved.id,
@@ -1604,10 +1644,8 @@ async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFA
                 sig_info = f" (sig: '{signature}')" if custom_title else ""
                 approved.append(f"✅ @{username} ({kind}, ID: {resolved.id}){sig_info}")
 
-                # Small delay to avoid rate limits
                 await asyncio.sleep(0.3)
 
-            # Build response
             response_parts = []
             if approved:
                 response_parts.append(f"*Approved {len(approved)}:*\n" + "\n".join(approved))
@@ -1623,7 +1661,6 @@ async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFA
                 await message.reply_text("Nothing was approved.")
             return
 
-    # Normal group/channel message moderation
     if chat.type == ChatType.PRIVATE:
         return
     await moderate_message(update, context)
@@ -1852,68 +1889,29 @@ async def notify_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat
 
 
 # --------------------------------------------------------------------------
-# Keep-alive web server
-# --------------------------------------------------------------------------
-
-_start_time = time.time()
-
-
-async def _keep_alive_root(request):
-    return web.json_response({"status": "ok", "uptime_seconds": int(time.time() - _start_time)})
-
-
-async def start_keep_alive_server():
-    app = web.Application()
-    app.router.add_get("/", _keep_alive_root)
-    app.router.add_get("/health", _keep_alive_root)
-    app.router.add_get("/functions", list_functions_endpoint)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
-    await site.start()
-    log.info("Keep-alive server listening on :%s", PORT)
-    return runner
-
-
-async def list_functions_endpoint(request):
-    return web.json_response(list_all_functions())
-
-
-async def self_ping():
-    """Ping our own health endpoint to prevent host sleep."""
-    url = f"http://localhost:{PORT}/health"
-    while True:
-        await asyncio.sleep(600)  # 10 minutes
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=5) as resp:
-                    log.debug(f"Self-ping: {resp.status}")
-        except Exception as e:
-            log.debug(f"Self-ping failed: {e}")
-
-
-# --------------------------------------------------------------------------
 # Error handler
 # --------------------------------------------------------------------------
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log errors and continue running."""
     try:
         err = context.error
         if isinstance(err, (NetworkError, TimedOut)):
             log.warning(f"Network error (will retry): {err}")
             return
+        if isinstance(err, Conflict):
+            log.error(f"CONFLICT: Another instance is polling! Restarting...")
+            os._exit(1)
         log.error(f"Exception while handling an update: {err}", exc_info=err)
     except Exception as e:
         log.error(f"Error handler itself failed: {e}")
 
 
 # --------------------------------------------------------------------------
-# Entrypoint with auto-recovery
+# Bot runtime (async, run inside main thread's event loop)
 # --------------------------------------------------------------------------
 
 async def run_bot():
-    """Run the bot application once."""
+    """Run the bot application once. Health server runs in its own thread."""
     await init_db()
 
     application = (
@@ -1945,24 +1943,34 @@ async def run_bot():
             timeout=30,
         )
 
-        keep_alive_runner = None
-        if KEEP_ALIVE_ENABLED:
-            keep_alive_runner = await start_keep_alive_server()
-
-        ping_task = asyncio.create_task(self_ping())
-
         log.info("✅ Bot is up and polling.")
 
-        # Watchdog: periodically check if polling is still alive
+        # Watchdog: actively verify Telegram is reachable.
+        # If polling dies silently (network drop), this will detect it
+        # and force a process restart so Render spins up a fresh dyno.
         async def watchdog():
+            failures = 0
             while True:
-                await asyncio.sleep(60)
+                await asyncio.sleep(WATCHDOG_INTERVAL)
                 try:
-                    if not (application.updater and application.updater.running):
-                        log.warning("⚠️ Watchdog: updater stopped! Restarting...")
-                        break
+                    me = await asyncio.wait_for(
+                        application.bot.get_me(), timeout=15
+                    )
+                    if me:
+                        failures = 0
+                        log.debug("✅ Watchdog: Telegram reachable")
+                except (TimedOut, NetworkError) as e:
+                    failures += 1
+                    log.warning(f"⚠️ Watchdog: network failure #{failures}: {e}")
+                    if failures >= WATCHDOG_MAX_FAILURES:
+                        log.error("💀 Polling appears dead — forcing process exit")
+                        os._exit(1)
                 except Exception as e:
                     log.error(f"Watchdog error: {e}")
+                    failures += 1
+                    if failures >= WATCHDOG_MAX_FAILURES:
+                        log.error("💀 Watchdog failures — forcing process exit")
+                        os._exit(1)
 
         watchdog_task = asyncio.create_task(watchdog())
 
@@ -1970,12 +1978,6 @@ async def run_bot():
             await asyncio.Event().wait()
         finally:
             watchdog_task.cancel()
-            ping_task.cancel()
-            if keep_alive_runner:
-                try:
-                    await keep_alive_runner.cleanup()
-                except Exception:
-                    pass
             try:
                 await application.updater.stop()
             except Exception:
@@ -2015,8 +2017,25 @@ async def run_bot_with_recovery():
                 raise
 
 
+# --------------------------------------------------------------------------
+# Entrypoint
+# --------------------------------------------------------------------------
+
 def main():
-    """Entry point with signal handling."""
+    log.info("=" * 60)
+    log.info("  Admin Auto-Delete Bot — Starting")
+    log.info("=" * 60)
+
+    # 1. Start Flask health server in a daemon thread
+    #    (survives even if the bot's event loop hangs)
+    if KEEP_ALIVE_ENABLED:
+        health_thread = threading.Thread(target=run_health_server, daemon=True)
+        health_thread.start()
+        log.info(f"✅ Health server thread started on port {PORT}")
+    else:
+        log.info("ℹ️ Health server disabled (KEEP_ALIVE_ENABLED=false)")
+
+    # 2. Run the bot in the main thread with its own event loop
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -2025,7 +2044,7 @@ def main():
         log.info("Bot stopped by user (KeyboardInterrupt)")
     except Exception as e:
         log.error(f"Fatal error: {e}", exc_info=True)
-        raise
+        sys.exit(1)
 
 
 if __name__ == "__main__":
