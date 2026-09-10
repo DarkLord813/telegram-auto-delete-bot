@@ -3,9 +3,11 @@ import logging
 import os
 import time
 import inspect
+import signal
 from typing import List, Dict, Any, Optional
 
 import aiosqlite
+import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
 from telegram import (
@@ -15,7 +17,7 @@ from telegram import (
     ChatMember,
 )
 from telegram.constants import ChatType, ChatMemberStatus, ParseMode
-from telegram.error import TelegramError
+from telegram.error import TelegramError, NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -44,12 +46,14 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Set it in your environment or a .env file.")
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", level=logging.INFO
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
+logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 log = logging.getLogger("autodelete-bot")
 
-# Timer presets including 30 seconds
 TIMER_PRESETS = [
     ("Instant", 0),
     ("30 secs", 30),
@@ -59,13 +63,12 @@ TIMER_PRESETS = [
     ("1 hour", 3600),
 ]
 
-# Default banned keywords
 DEFAULT_BANNED_KEYWORDS = [
     "sex", "18+", "porn", "xxx", "nsfw", "adult", "nude", "naked",
     "fuck", "shit", "asshole", "bitch", "cunt", "dick", "pussy",
     "penis", "vagina", "boobs", "tits", "cum", "semen", "orgasm",
     "masturbate", "incest", "rape", "drugs", "cocaine", "heroin",
-    "meth", "crack", "weed", "marijuana", "lsd", "mdma", "🔞",  "ecstasy"
+    "meth", "crack", "weed", "marijuana", "lsd", "mdma", "ecstasy"
 ]
 
 MANAGEABLE_TYPES = (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL)
@@ -147,78 +150,105 @@ async def init_db():
 
 
 async def ensure_chat(chat_id: int, title: str | None = None, chat_type: str | None = None):
-    await db.execute(
-        "INSERT OR IGNORE INTO chats (chat_id, title, type, delete_delay, enabled, managing_started) VALUES (?, ?, ?, ?, ?, ?)",
-        (chat_id, title, chat_type, DEFAULT_DELETE_DELAY, 0, 0),
-    )
-    if title:
-        await db.execute("UPDATE chats SET title = ? WHERE chat_id = ?", (title, chat_id))
-    if chat_type:
-        await db.execute("UPDATE chats SET type = ? WHERE chat_id = ?", (chat_type, chat_id))
-    await db.commit()
+    try:
+        await db.execute(
+            "INSERT OR IGNORE INTO chats (chat_id, title, type, delete_delay, enabled, managing_started) VALUES (?, ?, ?, ?, ?, ?)",
+            (chat_id, title, chat_type, DEFAULT_DELETE_DELAY, 0, 0),
+        )
+        if title:
+            await db.execute("UPDATE chats SET title = ? WHERE chat_id = ?", (title, chat_id))
+        if chat_type:
+            await db.execute("UPDATE chats SET type = ? WHERE chat_id = ?", (chat_type, chat_id))
+        await db.commit()
+    except Exception as e:
+        log.error(f"ensure_chat failed: {e}")
 
 
 async def mark_bot_admin(chat_id: int, title: str | None, chat_type: str, is_admin: bool):
     await ensure_chat(chat_id, title, chat_type)
-    await db.execute(
-        "UPDATE chats SET bot_is_admin = ? WHERE chat_id = ?", (int(is_admin), chat_id)
-    )
-    await db.commit()
+    try:
+        await db.execute(
+            "UPDATE chats SET bot_is_admin = ? WHERE chat_id = ?", (int(is_admin), chat_id)
+        )
+        await db.commit()
+    except Exception as e:
+        log.error(f"mark_bot_admin failed: {e}")
 
 
 async def list_known_chats() -> list[tuple[int, str, str]]:
-    cur = await db.execute(
-        "SELECT chat_id, title, type FROM chats WHERE bot_is_admin = 1 ORDER BY title"
-    )
-    rows = await cur.fetchall()
-    await cur.close()
-    return rows
+    try:
+        cur = await db.execute(
+            "SELECT chat_id, title, type FROM chats WHERE bot_is_admin = 1 ORDER BY title"
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return rows
+    except Exception as e:
+        log.error(f"list_known_chats failed: {e}")
+        return []
 
 
 async def get_settings(chat_id: int) -> dict:
     await ensure_chat(chat_id)
-    cur = await db.execute(
-        "SELECT delete_delay, force_join, enabled, managing_started FROM chats WHERE chat_id = ?", (chat_id,)
-    )
-    row = await cur.fetchone()
-    await cur.close()
-    return {
-        "delete_delay": row[0],
-        "force_join": bool(row[1]),
-        "enabled": bool(row[2]),
-        "managing_started": bool(row[3])
-    }
+    try:
+        cur = await db.execute(
+            "SELECT delete_delay, force_join, enabled, managing_started FROM chats WHERE chat_id = ?",
+            (chat_id,)
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return {
+            "delete_delay": row[0],
+            "force_join": bool(row[1]),
+            "enabled": bool(row[2]),
+            "managing_started": bool(row[3])
+        }
+    except Exception as e:
+        log.error(f"get_settings failed: {e}")
+        return {"delete_delay": 300, "force_join": True, "enabled": False, "managing_started": False}
 
 
 async def set_delete_delay(chat_id: int, seconds: int):
     await ensure_chat(chat_id)
-    await db.execute("UPDATE chats SET delete_delay = ? WHERE chat_id = ?", (seconds, chat_id))
-    await db.commit()
+    try:
+        await db.execute("UPDATE chats SET delete_delay = ? WHERE chat_id = ?", (seconds, chat_id))
+        await db.commit()
+    except Exception as e:
+        log.error(f"set_delete_delay failed: {e}")
 
 
 async def toggle_force_join(chat_id: int) -> bool:
     s = await get_settings(chat_id)
     new_val = not s["force_join"]
-    await db.execute(
-        "UPDATE chats SET force_join = ? WHERE chat_id = ?", (int(new_val), chat_id)
-    )
-    await db.commit()
+    try:
+        await db.execute(
+            "UPDATE chats SET force_join = ? WHERE chat_id = ?", (int(new_val), chat_id)
+        )
+        await db.commit()
+    except Exception as e:
+        log.error(f"toggle_force_join failed: {e}")
     return new_val
 
 
 async def toggle_enabled(chat_id: int) -> bool:
     s = await get_settings(chat_id)
     new_val = not s["enabled"]
-    await db.execute("UPDATE chats SET enabled = ? WHERE chat_id = ?", (int(new_val), chat_id))
-    await db.commit()
+    try:
+        await db.execute("UPDATE chats SET enabled = ? WHERE chat_id = ?", (int(new_val), chat_id))
+        await db.commit()
+    except Exception as e:
+        log.error(f"toggle_enabled failed: {e}")
     return new_val
 
 
 async def start_managing(chat_id: int) -> bool:
-    await db.execute(
-        "UPDATE chats SET enabled = 1, managing_started = 1 WHERE chat_id = ?", (chat_id,)
-    )
-    await db.commit()
+    try:
+        await db.execute(
+            "UPDATE chats SET enabled = 1, managing_started = 1 WHERE chat_id = ?", (chat_id,)
+        )
+        await db.commit()
+    except Exception as e:
+        log.error(f"start_managing failed: {e}")
     return True
 
 
@@ -228,212 +258,261 @@ async def is_managing_started(chat_id: int) -> bool:
 
 
 async def is_approved(chat_id: int, user_id: int) -> bool:
-    cur = await db.execute(
-        "SELECT 1 FROM approved_admins WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
-    )
-    row = await cur.fetchone()
-    await cur.close()
-    return row is not None
+    try:
+        cur = await db.execute(
+            "SELECT 1 FROM approved_admins WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return row is not None
+    except Exception as e:
+        log.error(f"is_approved failed: {e}")
+        return False
 
 
 async def list_all_approved(chat_id: int) -> list[dict]:
-    """Every approved row for this chat, including ones approved manually by
-    username that Telegram's live admin list may not currently be returning."""
-    cur = await db.execute(
-        "SELECT user_id, name, username, signature, is_bot FROM approved_admins WHERE chat_id = ?",
-        (chat_id,),
-    )
-    rows = await cur.fetchall()
-    await cur.close()
-    return [
-        {
-            "user_id": r[0],
-            "name": r[1],
-            "username": r[2],
-            "signature": r[3],
-            "is_bot": bool(r[4]),
-        }
-        for r in rows
-    ]
+    try:
+        cur = await db.execute(
+            "SELECT user_id, name, username, signature, is_bot FROM approved_admins WHERE chat_id = ?",
+            (chat_id,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [
+            {
+                "user_id": r[0],
+                "name": r[1],
+                "username": r[2],
+                "signature": r[3],
+                "is_bot": bool(r[4]),
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        log.error(f"list_all_approved failed: {e}")
+        return []
 
 
 async def is_approved_multi(chat_id: int, user_id: int | None, username: str | None,
                              full_name: str | None, signature: str | None = None) -> tuple[bool, str]:
-    """Approval check with fallbacks: user_id -> username -> signature -> display name."""
-    if user_id is not None:
-        cur = await db.execute(
-            "SELECT 1 FROM approved_admins WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
-        )
-        if await cur.fetchone():
+    try:
+        if user_id is not None:
+            cur = await db.execute(
+                "SELECT 1 FROM approved_admins WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+            )
+            if await cur.fetchone():
+                await cur.close()
+                return True, "user_id"
             await cur.close()
-            return True, "user_id"
-        await cur.close()
 
-    if username:
-        cur = await db.execute(
-            "SELECT 1 FROM approved_admins WHERE chat_id = ? AND username = ? COLLATE NOCASE",
-            (chat_id, username.lstrip("@")),
-        )
-        if await cur.fetchone():
+        if username:
+            cur = await db.execute(
+                "SELECT 1 FROM approved_admins WHERE chat_id = ? AND username = ? COLLATE NOCASE",
+                (chat_id, username.lstrip("@")),
+            )
+            if await cur.fetchone():
+                await cur.close()
+                return True, "username"
             await cur.close()
-            return True, "username"
-        await cur.close()
 
-    if signature:
-        cur = await db.execute(
-            "SELECT 1 FROM approved_admins WHERE chat_id = ? AND signature = ? COLLATE NOCASE",
-            (chat_id, signature),
-        )
-        if await cur.fetchone():
+        if signature:
+            cur = await db.execute(
+                "SELECT 1 FROM approved_admins WHERE chat_id = ? AND signature = ? COLLATE NOCASE",
+                (chat_id, signature),
+            )
+            if await cur.fetchone():
+                await cur.close()
+                return True, "signature"
             await cur.close()
-            return True, "signature"
-        await cur.close()
 
-    if full_name:
-        cur = await db.execute(
-            "SELECT 1 FROM approved_admins WHERE chat_id = ? AND name = ? COLLATE NOCASE",
-            (chat_id, full_name),
-        )
-        if await cur.fetchone():
+        if full_name:
+            cur = await db.execute(
+                "SELECT 1 FROM approved_admins WHERE chat_id = ? AND name = ? COLLATE NOCASE",
+                (chat_id, full_name),
+            )
+            if await cur.fetchone():
+                await cur.close()
+                return True, "name"
             await cur.close()
-            return True, "name"
-        await cur.close()
+    except Exception as e:
+        log.error(f"is_approved_multi failed: {e}")
 
     return False, ""
 
 
 async def toggle_approved(chat_id: int, user_id: int, name: str, username: str | None, signature: str | None, is_bot: bool = False):
-    if await is_approved(chat_id, user_id):
-        await db.execute(
-            "DELETE FROM approved_admins WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
-        )
-    else:
-        await db.execute(
-            "INSERT OR REPLACE INTO approved_admins (chat_id, user_id, name, username, signature, is_bot) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (chat_id, user_id, name, username, signature, int(is_bot)),
-        )
-    await db.commit()
+    try:
+        if await is_approved(chat_id, user_id):
+            await db.execute(
+                "DELETE FROM approved_admins WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+            )
+        else:
+            await db.execute(
+                "INSERT OR REPLACE INTO approved_admins (chat_id, user_id, name, username, signature, is_bot) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (chat_id, user_id, name, username, signature, int(is_bot)),
+            )
+        await db.commit()
+    except Exception as e:
+        log.error(f"toggle_approved failed: {e}")
 
 
 async def is_signature_approved(chat_id: int, signature: str | None) -> bool:
     if not signature:
         return False
-    cur = await db.execute(
-        "SELECT 1 FROM approved_admins WHERE chat_id = ? AND signature = ? COLLATE NOCASE",
-        (chat_id, signature),
-    )
-    row = await cur.fetchone()
-    await cur.close()
-    return row is not None
+    try:
+        cur = await db.execute(
+            "SELECT 1 FROM approved_admins WHERE chat_id = ? AND signature = ? COLLATE NOCASE",
+            (chat_id, signature),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return row is not None
+    except Exception as e:
+        log.error(f"is_signature_approved failed: {e}")
+        return False
 
 
 async def list_keywords(chat_id: int) -> list[str]:
-    cur = await db.execute(
-        "SELECT keyword FROM banned_keywords WHERE chat_id = ? ORDER BY keyword", (chat_id,)
-    )
-    rows = await cur.fetchall()
-    await cur.close()
-    return [r[0] for r in rows]
+    try:
+        cur = await db.execute(
+            "SELECT keyword FROM banned_keywords WHERE chat_id = ? ORDER BY keyword", (chat_id,)
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [r[0] for r in rows]
+    except Exception as e:
+        log.error(f"list_keywords failed: {e}")
+        return []
 
 
 async def add_keyword(chat_id: int, keyword: str):
     await ensure_chat(chat_id)
     keyword = keyword.strip().lower()[:40]
     if keyword:
-        await db.execute(
-            "INSERT OR IGNORE INTO banned_keywords (chat_id, keyword) VALUES (?, ?)",
-            (chat_id, keyword),
-        )
-        await db.commit()
+        try:
+            await db.execute(
+                "INSERT OR IGNORE INTO banned_keywords (chat_id, keyword) VALUES (?, ?)",
+                (chat_id, keyword),
+            )
+            await db.commit()
+        except Exception as e:
+            log.error(f"add_keyword failed: {e}")
 
 
 async def remove_keyword_by_index(chat_id: int, index: int):
     kws = await list_keywords(chat_id)
     if 0 <= index < len(kws):
-        await db.execute(
-            "DELETE FROM banned_keywords WHERE chat_id = ? AND keyword = ?",
-            (chat_id, kws[index]),
-        )
-        await db.commit()
+        try:
+            await db.execute(
+                "DELETE FROM banned_keywords WHERE chat_id = ? AND keyword = ?",
+                (chat_id, kws[index]),
+            )
+            await db.commit()
+        except Exception as e:
+            log.error(f"remove_keyword_by_index failed: {e}")
 
 
 async def list_whitelist(chat_id: int) -> list[str]:
-    cur = await db.execute(
-        "SELECT keyword FROM whitelist_keywords WHERE chat_id = ? ORDER BY keyword", (chat_id,)
-    )
-    rows = await cur.fetchall()
-    await cur.close()
-    return [r[0] for r in rows]
+    try:
+        cur = await db.execute(
+            "SELECT keyword FROM whitelist_keywords WHERE chat_id = ? ORDER BY keyword", (chat_id,)
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [r[0] for r in rows]
+    except Exception as e:
+        log.error(f"list_whitelist failed: {e}")
+        return []
 
 
 async def add_whitelist_keyword(chat_id: int, keyword: str):
     await ensure_chat(chat_id)
     keyword = keyword.strip().lower()[:40]
     if keyword:
-        await db.execute(
-            "INSERT OR IGNORE INTO whitelist_keywords (chat_id, keyword) VALUES (?, ?)",
-            (chat_id, keyword),
-        )
-        await db.commit()
+        try:
+            await db.execute(
+                "INSERT OR IGNORE INTO whitelist_keywords (chat_id, keyword) VALUES (?, ?)",
+                (chat_id, keyword),
+            )
+            await db.commit()
+        except Exception as e:
+            log.error(f"add_whitelist_keyword failed: {e}")
 
 
 async def remove_whitelist_keyword_by_index(chat_id: int, index: int):
     kws = await list_whitelist(chat_id)
     if 0 <= index < len(kws):
-        await db.execute(
-            "DELETE FROM whitelist_keywords WHERE chat_id = ? AND keyword = ?",
-            (chat_id, kws[index]),
-        )
-        await db.commit()
+        try:
+            await db.execute(
+                "DELETE FROM whitelist_keywords WHERE chat_id = ? AND keyword = ?",
+                (chat_id, kws[index]),
+            )
+            await db.commit()
+        except Exception as e:
+            log.error(f"remove_whitelist_keyword_by_index failed: {e}")
 
 
 async def approve_admin(chat_id: int, user_id: int, name: str, username: str | None,
                          signature: str | None, is_bot: bool = False):
-    """Unconditional approve (not a toggle)."""
     await ensure_chat(chat_id)
-    await db.execute(
-        "INSERT OR REPLACE INTO approved_admins (chat_id, user_id, name, username, signature, is_bot) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (chat_id, user_id, name, username, signature, int(is_bot)),
-    )
-    await db.commit()
-    log.info(f"✅ Approved admin {user_id} (@{username}) with signature '{signature}' in chat {chat_id}")
+    try:
+        await db.execute(
+            "INSERT OR REPLACE INTO approved_admins (chat_id, user_id, name, username, signature, is_bot) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (chat_id, user_id, name, username, signature, int(is_bot)),
+        )
+        await db.commit()
+        log.info(f"✅ Approved admin {user_id} (@{username}) with signature '{signature}' in chat {chat_id}")
+    except Exception as e:
+        log.error(f"approve_admin failed: {e}")
 
 
 async def is_notify_subscribed(chat_id: int, user_id: int) -> bool:
-    cur = await db.execute(
-        "SELECT 1 FROM delete_notify_subscribers WHERE chat_id = ? AND user_id = ?",
-        (chat_id, user_id),
-    )
-    row = await cur.fetchone()
-    await cur.close()
-    return row is not None
+    try:
+        cur = await db.execute(
+            "SELECT 1 FROM delete_notify_subscribers WHERE chat_id = ? AND user_id = ?",
+            (chat_id, user_id),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return row is not None
+    except Exception as e:
+        log.error(f"is_notify_subscribed failed: {e}")
+        return False
 
 
 async def toggle_notify_subscription(chat_id: int, user_id: int) -> bool:
-    if await is_notify_subscribed(chat_id, user_id):
+    try:
+        if await is_notify_subscribed(chat_id, user_id):
+            await db.execute(
+                "DELETE FROM delete_notify_subscribers WHERE chat_id = ? AND user_id = ?",
+                (chat_id, user_id),
+            )
+            await db.commit()
+            return False
         await db.execute(
-            "DELETE FROM delete_notify_subscribers WHERE chat_id = ? AND user_id = ?",
+            "INSERT OR IGNORE INTO delete_notify_subscribers (chat_id, user_id) VALUES (?, ?)",
             (chat_id, user_id),
         )
         await db.commit()
+        return True
+    except Exception as e:
+        log.error(f"toggle_notify_subscription failed: {e}")
         return False
-    await db.execute(
-        "INSERT OR IGNORE INTO delete_notify_subscribers (chat_id, user_id) VALUES (?, ?)",
-        (chat_id, user_id),
-    )
-    await db.commit()
-    return True
 
 
 async def list_notify_subscribers(chat_id: int) -> list[int]:
-    cur = await db.execute(
-        "SELECT user_id FROM delete_notify_subscribers WHERE chat_id = ?", (chat_id,)
-    )
-    rows = await cur.fetchall()
-    await cur.close()
-    return [r[0] for r in rows]
+    try:
+        cur = await db.execute(
+            "SELECT user_id FROM delete_notify_subscribers WHERE chat_id = ?", (chat_id,)
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [r[0] for r in rows]
+    except Exception as e:
+        log.error(f"list_notify_subscribers failed: {e}")
+        return []
 
 
 async def init_default_keywords(chat_id: int):
@@ -444,77 +523,98 @@ async def init_default_keywords(chat_id: int):
 
 
 async def remove_chat_from_management(chat_id: int, reason: str = "User removed"):
-    await db.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
-    await db.execute("DELETE FROM approved_admins WHERE chat_id = ?", (chat_id,))
-    await db.execute("DELETE FROM banned_keywords WHERE chat_id = ?", (chat_id,))
-    await db.execute("DELETE FROM all_admins WHERE chat_id = ?", (chat_id,))
-    await db.execute(
-        "INSERT OR REPLACE INTO removed_chats (chat_id, removed_at, reason) VALUES (?, ?, ?)",
-        (chat_id, int(time.time()), reason)
-    )
-    await db.commit()
-    log.info(f"Chat {chat_id} removed from management. Reason: {reason}")
+    try:
+        await db.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
+        await db.execute("DELETE FROM approved_admins WHERE chat_id = ?", (chat_id,))
+        await db.execute("DELETE FROM banned_keywords WHERE chat_id = ?", (chat_id,))
+        await db.execute("DELETE FROM all_admins WHERE chat_id = ?", (chat_id,))
+        await db.execute(
+            "INSERT OR REPLACE INTO removed_chats (chat_id, removed_at, reason) VALUES (?, ?, ?)",
+            (chat_id, int(time.time()), reason)
+        )
+        await db.commit()
+        log.info(f"Chat {chat_id} removed from management. Reason: {reason}")
+    except Exception as e:
+        log.error(f"remove_chat_from_management failed: {e}")
 
 
 async def is_chat_removed(chat_id: int) -> bool:
-    cur = await db.execute("SELECT 1 FROM removed_chats WHERE chat_id = ?", (chat_id,))
-    row = await cur.fetchone()
-    await cur.close()
-    return row is not None
+    try:
+        cur = await db.execute("SELECT 1 FROM removed_chats WHERE chat_id = ?", (chat_id,))
+        row = await cur.fetchone()
+        await cur.close()
+        return row is not None
+    except Exception as e:
+        log.error(f"is_chat_removed failed: {e}")
+        return False
 
 
 async def restore_chat(chat_id: int):
-    await db.execute("DELETE FROM removed_chats WHERE chat_id = ?", (chat_id,))
-    await db.commit()
-    log.info(f"Chat {chat_id} restored to management")
+    try:
+        await db.execute("DELETE FROM removed_chats WHERE chat_id = ?", (chat_id,))
+        await db.commit()
+        log.info(f"Chat {chat_id} restored to management")
+    except Exception as e:
+        log.error(f"restore_chat failed: {e}")
 
 
 async def list_removed_chats() -> list[tuple[int, str, int]]:
-    cur = await db.execute(
-        "SELECT chat_id, reason, removed_at FROM removed_chats ORDER BY removed_at DESC"
-    )
-    rows = await cur.fetchall()
-    await cur.close()
-    return rows
+    try:
+        cur = await db.execute(
+            "SELECT chat_id, reason, removed_at FROM removed_chats ORDER BY removed_at DESC"
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return rows
+    except Exception as e:
+        log.error(f"list_removed_chats failed: {e}")
+        return []
 
 
 async def store_all_admins(chat_id: int, admins: List[ChatMember]):
-    for admin in admins:
-        await db.execute(
-            """INSERT OR REPLACE INTO all_admins 
-               (chat_id, user_id, name, username, is_bot, status, last_updated) 
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                chat_id,
-                admin.user.id,
-                admin.user.full_name or admin.user.username or str(admin.user.id),
-                admin.user.username,
-                int(admin.user.is_bot),
-                admin.status,
-                int(time.time())
+    try:
+        for admin in admins:
+            await db.execute(
+                """INSERT OR REPLACE INTO all_admins 
+                   (chat_id, user_id, name, username, is_bot, status, last_updated) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    chat_id,
+                    admin.user.id,
+                    admin.user.full_name or admin.user.username or str(admin.user.id),
+                    admin.user.username,
+                    int(admin.user.is_bot),
+                    admin.status,
+                    int(time.time())
+                )
             )
-        )
-    await db.commit()
-    log.info(f"Stored {len(admins)} admins for chat {chat_id}")
+        await db.commit()
+        log.info(f"Stored {len(admins)} admins for chat {chat_id}")
+    except Exception as e:
+        log.error(f"store_all_admins failed: {e}")
 
 
 async def get_all_admins(chat_id: int) -> list[dict]:
-    cur = await db.execute(
-        "SELECT user_id, name, username, is_bot, status FROM all_admins WHERE chat_id = ?",
-        (chat_id,)
-    )
-    rows = await cur.fetchall()
-    await cur.close()
-    return [
-        {
-            "user_id": row[0],
-            "name": row[1],
-            "username": row[2],
-            "is_bot": bool(row[3]),
-            "status": row[4]
-        }
-        for row in rows
-    ]
+    try:
+        cur = await db.execute(
+            "SELECT user_id, name, username, is_bot, status FROM all_admins WHERE chat_id = ?",
+            (chat_id,)
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [
+            {
+                "user_id": row[0],
+                "name": row[1],
+                "username": row[2],
+                "is_bot": bool(row[3]),
+                "status": row[4]
+            }
+            for row in rows
+        ]
+    except Exception as e:
+        log.error(f"get_all_admins failed: {e}")
+        return []
 
 
 # --------------------------------------------------------------------------
@@ -569,7 +669,7 @@ def list_all_functions() -> Dict[str, List[Dict[str, Any]]]:
                 functions["Utility"].append(func_info)
             elif name in ("_keep_alive_root", "start_keep_alive_server", "list_functions_endpoint"):
                 functions["Web Server"].append(func_info)
-            elif name == "main":
+            elif name in ("main", "run_bot", "run_bot_with_recovery", "self_ping"):
                 functions["Entrypoint"].append(func_info)
 
     return functions
@@ -729,7 +829,6 @@ async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, Inl
             "custom_title": m.custom_title or ""
         })
 
-    # Merge in anyone approved by username who isn't in Telegram's live/cached admin list
     seen_ids = {a["user_id"] for a in admin_list}
     for approved_row in await list_all_approved(chat_id):
         if approved_row["user_id"] in seen_ids:
@@ -836,12 +935,14 @@ async def keywords_menu_markup(chat_id: int) -> tuple[str, InlineKeyboardMarkup]
     rows = []
     for i, kw in enumerate(kws):
         rows.append([InlineKeyboardButton(f"❌ {kw}", callback_data=f"kd:{chat_id}:{i}")])
-    rows.append([InlineKeyboardButton("➕ Add Keyword", callback_data=f"ka:{chat_id}")])
+    rows.append([InlineKeyboardButton("➕ Add Keyword(s)", callback_data=f"ka:{chat_id}")])
     rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"menu:{chat_id}")])
     text = (
         "*🚫 Blacklist*\n\n"
         "Messages containing any of these are deleted — unless the message "
         "also matches a ✅ Whitelist entry, which always wins.\n\n"
+        "💡 When adding, you can send *multiple keywords, one per line* "
+        "to bulk add them.\n\n"
     )
     text += ("Current: " + ", ".join(kws)) if kws else "_No blacklist keywords yet._"
     return text, InlineKeyboardMarkup(rows)
@@ -852,12 +953,14 @@ async def whitelist_menu_markup(chat_id: int) -> tuple[str, InlineKeyboardMarkup
     rows = []
     for i, kw in enumerate(kws):
         rows.append([InlineKeyboardButton(f"❌ {kw}", callback_data=f"wd:{chat_id}:{i}")])
-    rows.append([InlineKeyboardButton("➕ Add Keyword", callback_data=f"wa:{chat_id}")])
+    rows.append([InlineKeyboardButton("➕ Add Keyword(s)", callback_data=f"wa:{chat_id}")])
     rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"menu:{chat_id}")])
     text = (
         "*✅ Whitelist*\n\n"
         "Messages containing any of these are *never* deleted — this "
         "overrides the blacklist and un-approved-admin auto-deletion alike.\n\n"
+        "💡 When adding, you can send *multiple keywords, one per line* "
+        "to bulk add them.\n\n"
     )
     text += ("Current: " + ", ".join(kws)) if kws else "_No whitelist keywords yet._"
     return text, InlineKeyboardMarkup(rows)
@@ -963,7 +1066,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Select your chat\n"
             "• Configure settings\n"
             "• Tap 'START MANAGING' to begin\n\n"
-            "**Tip:** Use 'Refresh Admins' to update the admin list"
+            "**Tip:** You can add *multiple keywords* or approve *multiple "
+            "admins* at once by sending them one per line."
         )
         picker_text, picker_markup = await build_chat_picker(context.bot, user.id)
 
@@ -1171,7 +1275,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             member = await context.bot.get_chat_member(target_chat_id, target_user_id)
             name = member.user.full_name or str(member.user.id)
             username = member.user.username
-            # Use custom_title if set, otherwise use the display name as signature
             custom_title = member.custom_title
             signature = custom_title or name
             is_bot = member.user.is_bot
@@ -1215,7 +1318,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "ka":
         PENDING_INPUT[(reply_chat.id, user.id)] = ("add_keyword", target_chat_id)
         await query.edit_message_text(
-            "✏️ Send the keyword or phrase to ban, as a message here.",
+            "✏️ Send keyword(s) to *blacklist*.\n\n"
+            "*Multiple keywords:* send one per line to add them all at once.\n"
+            "Example:\n`scam`\n`spam`\n`free money`",
+            parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🔙 Cancel", callback_data=f"kw:{target_chat_id}")]]
             ),
@@ -1234,7 +1340,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "wa":
         PENDING_INPUT[(reply_chat.id, user.id)] = ("add_whitelist", target_chat_id)
         await query.edit_message_text(
-            "✏️ Send the keyword or phrase to whitelist, as a message here.",
+            "✏️ Send keyword(s) to *whitelist*.\n\n"
+            "*Multiple keywords:* send one per line to add them all at once.\n"
+            "Example:\n`official`\n`announcement`\n`update`",
+            parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🔙 Cancel", callback_data=f"wl:{target_chat_id}")]]
             ),
@@ -1249,8 +1358,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "aub":
         PENDING_INPUT[(reply_chat.id, user.id)] = ("approve_bot_username", target_chat_id)
         await query.edit_message_text(
-            "✏️ Send the *username* of the bot or admin to approve (with or "
-            "without the @). It must already be an admin of the chat.",
+            "✏️ Send the *username(s)* of bot(s)/admin(s) to approve.\n\n"
+            "*Multiple usernames:* send one per line to approve them all at once.\n"
+            "Example:\n`@InsideAds_bot`\n`@GamerDroid_bot`\n`@SomeOther_bot`\n\n"
+            "With or without @. Each must already be an admin of the chat.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🔙 Cancel", callback_data=f"adm:{target_chat_id}")]]
@@ -1375,11 +1486,11 @@ async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFA
 
     if key and key in PENDING_INPUT:
         action, target_chat_id = PENDING_INPUT.pop(key)
-        text = (message.text or "").strip()
+        raw_text = (message.text or "").strip()
 
         if action == "custom_timer":
-            if text.isdigit() and int(text) >= 0:
-                seconds = int(text) * 60
+            if raw_text.isdigit() and int(raw_text) >= 0:
+                seconds = int(raw_text) * 60
                 await set_delete_delay(target_chat_id, seconds)
                 await message.reply_text(f"✅ Deletion timer set to {fmt_delay(seconds)}.")
             else:
@@ -1392,9 +1503,25 @@ async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFA
             return
 
         if action == "add_keyword":
-            if text:
-                await add_keyword(target_chat_id, text)
-                await message.reply_text(f"✅ Blacklist keyword added: {text}")
+            # Support multiple keywords: split on newlines, also handle commas
+            lines = [ln.strip() for ln in raw_text.replace(",", "\n").split("\n")]
+            keywords = [ln.lower() for ln in lines if ln]
+            if keywords:
+                added = 0
+                for kw in keywords:
+                    await add_keyword(target_chat_id, kw)
+                    added += 1
+                if added == 1:
+                    await message.reply_text(f"✅ Blacklist keyword added: {keywords[0]}")
+                else:
+                    preview = "\n".join(f"• {k}" for k in keywords[:20])
+                    more = f"\n_...and {added - 20} more_" if added > 20 else ""
+                    await message.reply_text(
+                        f"✅ Added *{added}* blacklist keywords:\n\n{preview}{more}",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+            else:
+                await message.reply_text("No valid keywords found.")
             if chat.type != ChatType.PRIVATE:
                 try:
                     await message.delete()
@@ -1403,9 +1530,24 @@ async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFA
             return
 
         if action == "add_whitelist":
-            if text:
-                await add_whitelist_keyword(target_chat_id, text)
-                await message.reply_text(f"✅ Whitelist keyword added: {text}")
+            lines = [ln.strip() for ln in raw_text.replace(",", "\n").split("\n")]
+            keywords = [ln.lower() for ln in lines if ln]
+            if keywords:
+                added = 0
+                for kw in keywords:
+                    await add_whitelist_keyword(target_chat_id, kw)
+                    added += 1
+                if added == 1:
+                    await message.reply_text(f"✅ Whitelist keyword added: {keywords[0]}")
+                else:
+                    preview = "\n".join(f"• {k}" for k in keywords[:20])
+                    more = f"\n_...and {added - 20} more_" if added > 20 else ""
+                    await message.reply_text(
+                        f"✅ Added *{added}* whitelist keywords:\n\n{preview}{more}",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+            else:
+                await message.reply_text("No valid keywords found.")
             if chat.type != ChatType.PRIVATE:
                 try:
                     await message.delete()
@@ -1414,69 +1556,71 @@ async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFA
             return
 
         if action == "approve_bot_username":
-            username = text.lstrip("@").strip()
-            if not username:
-                await message.reply_text("Please send a valid username.")
+            # Support multiple usernames: split on newlines, also handle commas
+            lines = [ln.strip() for ln in raw_text.replace(",", "\n").split("\n")]
+            usernames = [ln.lstrip("@").strip() for ln in lines if ln]
+            if not usernames:
+                await message.reply_text("Please send at least one valid username.")
                 return
 
-            # Fetch user info from Telegram
-            try:
-                resolved = await context.bot.get_chat(f"@{username}")
-            except TelegramError:
-                await message.reply_text(f"❌ Couldn't find @{username}. Check the username and try again.")
-                return
+            approved = []
+            failed = []
 
-            # Check if user is a member of the chat
-            try:
-                member = await context.bot.get_chat_member(target_chat_id, resolved.id)
-            except TelegramError:
-                await message.reply_text(
-                    f"❌ @{username} isn't a member of that chat, so it can't be approved."
+            for username in usernames:
+                # Fetch user info from Telegram
+                try:
+                    resolved = await context.bot.get_chat(f"@{username}")
+                except TelegramError:
+                    failed.append(f"❌ @{username} — not found")
+                    continue
+
+                # Check if user is a member of the chat
+                try:
+                    member = await context.bot.get_chat_member(target_chat_id, resolved.id)
+                except TelegramError:
+                    failed.append(f"❌ @{username} — not a member")
+                    continue
+
+                if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+                    failed.append(f"⚠️ @{username} — not an admin")
+                    continue
+
+                # Get display name and signature
+                display_name = member.user.full_name or username
+                custom_title = member.custom_title
+                signature = custom_title or display_name
+
+                # Store approval
+                await approve_admin(
+                    target_chat_id,
+                    resolved.id,
+                    display_name,
+                    member.user.username,
+                    signature,
+                    member.user.is_bot
                 )
-                return
 
-            if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+                kind = "bot" if member.user.is_bot else "admin"
+                sig_info = f" (sig: '{signature}')" if custom_title else ""
+                approved.append(f"✅ @{username} ({kind}, ID: {resolved.id}){sig_info}")
+
+                # Small delay to avoid rate limits
+                await asyncio.sleep(0.3)
+
+            # Build response
+            response_parts = []
+            if approved:
+                response_parts.append(f"*Approved {len(approved)}:*\n" + "\n".join(approved))
+            if failed:
+                response_parts.append(f"*Failed {len(failed)}:*\n" + "\n".join(failed))
+
+            if response_parts:
                 await message.reply_text(
-                    f"⚠️ @{username} isn't an admin of that chat — only admins are subject to "
-                    f"filtering, so approving a non-admin has no effect. Promote it first."
+                    "\n\n".join(response_parts),
+                    parse_mode=ParseMode.MARKDOWN,
                 )
-                return
-
-            # Get the user's DISPLAY NAME (this is what appears in the channel)
-            display_name = member.user.full_name or username
-            
-            # Get custom title if set (custom title set in channel settings)
-            custom_title = member.custom_title
-            
-            # IMPORTANT: Use display name as signature for channel post matching
-            # This is what appears next to their posts in the channel
-            # If custom title is set, use that instead (it overrides the display)
-            signature = custom_title or display_name
-            
-            log.info(
-                f"Approving @{username}: display_name='{display_name}', "
-                f"custom_title='{custom_title}', using signature='{signature}'"
-            )
-
-            # Store approval with user_id, name, AND signature (using display name)
-            await approve_admin(
-                target_chat_id,
-                resolved.id,
-                display_name,  # Store the display name
-                member.user.username,
-                signature,  # Use display name (or custom title) for channel matching
-                member.user.is_bot
-            )
-
-            kind = "bot" if member.user.is_bot else "admin"
-            response = f"✅ Approved @{username} ({kind}, ID: {resolved.id})"
-            
-            if custom_title:
-                response += f"\n📝 Using Custom Title: '{custom_title}' for channel posts"
             else:
-                response += f"\n📝 Using display name: '{display_name}' for channel posts"
-
-            await message.reply_text(response)
+                await message.reply_text("Nothing was approved.")
             return
 
     # Normal group/channel message moderation
@@ -1491,11 +1635,9 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if message is None or chat.type not in MANAGEABLE_TYPES:
         return
 
-    # Check if chat has been removed
     if await is_chat_removed(chat.id):
         return
 
-    # Check if managing has been started
     if not await is_managing_started(chat.id):
         return
 
@@ -1505,7 +1647,6 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = message.text or message.caption or ""
 
-    # Don't moderate the bot's own messages
     bot_user = await context.bot.get_me()
     if message.from_user and message.from_user.id == bot_user.id:
         return
@@ -1517,22 +1658,17 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender_username = None
     sender_name = None
 
-    # Check if this is a channel post or anonymous group admin
     if message.sender_chat and message.sender_chat.id == chat.id:
-        # Channel post - the author_signature is what appears in the channel
         signature = message.author_signature
         sender_name = signature or "Anonymous"
-        sender_id = message.sender_chat.id  # Channel ID (for reference only)
+        sender_id = message.sender_chat.id
 
         if signature:
-            is_admin = True  # Channel admins are always admins
-
-            # Check by signature first (this will match if custom title or display name was stored)
+            is_admin = True
             is_approved_admin = await is_signature_approved(chat.id, signature)
             if is_approved_admin:
                 log.info(f"✅ Channel admin '{signature}' approved by signature")
             else:
-                # Fallback: check by signature as full_name
                 is_approved_admin, method = await is_approved_multi(
                     chat.id, None, None, signature, signature
                 )
@@ -1541,31 +1677,25 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     log.info(f"❌ Channel admin '{signature}' NOT approved")
         else:
-            # No signature - can't identify the admin
             log.info("Channel post with no signature - cannot identify admin, leaving message")
             return
     elif message.from_user:
-        # Regular user or bot
         sender_id = message.from_user.id
         sender_username = message.from_user.username
         sender_name = message.from_user.full_name
 
-        # Check if user is admin
         is_admin = await user_is_chat_admin(context.bot, chat.id, sender_id)
 
         if is_admin:
-            # Check by user_id first
             is_approved_admin = await is_approved(chat.id, sender_id)
             if is_approved_admin:
                 log.info(f"✅ Admin {sender_id} approved by user_id")
             else:
-                # Check by username, signature, or name
                 is_approved_admin, method = await is_approved_multi(
                     chat.id, sender_id, sender_username, sender_name, None
                 )
                 if is_approved_admin:
                     log.info(f"✅ Admin {sender_id} approved via {method} match")
-                    # Add the user_id to approved list for future
                     await approve_admin(
                         chat.id, sender_id, sender_name or str(sender_id),
                         sender_username, sender_name, message.from_user.is_bot
@@ -1573,16 +1703,13 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     log.info(f"📊 Message from {sender_name} (ID: {sender_id}): is_admin={is_admin}, is_approved_admin={is_approved_admin}")
 
-    # If not an admin, don't moderate
     if not is_admin:
         return
 
-    # If admin is approved, DON'T delete anything
     if is_approved_admin:
         log.info(f"✅ SKIPPING deletion - admin is approved")
         return
 
-    # Build sender label for notifications
     parts_label = []
     if sender_name:
         parts_label.append(sender_name)
@@ -1592,7 +1719,6 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts_label.append(f"ID: {sender_id}")
     sender_label = " / ".join(parts_label)
 
-    # Whitelist check
     if text:
         lowered = text.lower()
         for wl in await list_whitelist(chat.id):
@@ -1600,7 +1726,6 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log.info(f"📝 Whitelist match - keeping message")
                 return
 
-    # Blacklist check - only for non-approved admins
     if text and not is_approved_admin:
         lowered = text.lower()
         for kw in await list_keywords(chat.id):
@@ -1617,7 +1742,6 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     log.warning(f"Couldn't delete keyword-flagged message: {e}")
                     return
 
-    # Delete non-approved admin messages
     delay = settings["delete_delay"]
     if delay <= 0:
         try:
@@ -1651,16 +1775,13 @@ async def delete_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
     chat_id = data["chat_id"]
 
-    # Re-check approval right before deleting
     approved = False
 
     if data.get("signature"):
-        # For channel posts, check by signature
         approved = await is_signature_approved(chat_id, data["signature"])
         if approved:
             log.info(f"⏭️ Scheduled delete skipped — signature was approved during delay")
             return
-        # Also check by signature as name
         approved, _method = await is_approved_multi(
             chat_id, None, None, data["signature"], data["signature"]
         )
@@ -1668,7 +1789,6 @@ async def delete_job(context: ContextTypes.DEFAULT_TYPE):
             log.info(f"⏭️ Scheduled delete skipped — signature approved via {_method}")
             return
     else:
-        # For regular users, check by user_id, username, signature, or name
         approved, _method = await is_approved_multi(
             chat_id, data.get("sender_id"), data.get("sender_username"),
             data.get("sender_name"), None
@@ -1680,7 +1800,6 @@ async def delete_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=data["message_id"])
         log.info(f"✅ Scheduled deletion executed for chat {chat_id}")
-        # Build sender label for notification
         sender_name = data.get("sender_name")
         sender_username = data.get("sender_username")
         parts_label = []
@@ -1703,7 +1822,6 @@ async def delete_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def notify_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat_title: str,
                            sender_label: str, reason: str, snippet: str):
-    """DM every subscriber that a message was deleted."""
     subscribers = await list_notify_subscribers(chat_id)
     if not subscribers:
         return
@@ -1723,7 +1841,12 @@ async def notify_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat
 
     for user_id in subscribers:
         try:
-            await context.bot.send_message(user_id, text, parse_mode=ParseMode.MARKDOWN)
+            await asyncio.wait_for(
+                context.bot.send_message(user_id, text, parse_mode=ParseMode.MARKDOWN),
+                timeout=10
+            )
+        except asyncio.TimeoutError:
+            log.warning(f"DM to {user_id} timed out")
         except TelegramError as e:
             log.info(f"Couldn't DM delete-notification to {user_id}: {e}")
 
@@ -1756,14 +1879,54 @@ async def list_functions_endpoint(request):
     return web.json_response(list_all_functions())
 
 
+async def self_ping():
+    """Ping our own health endpoint to prevent host sleep."""
+    url = f"http://localhost:{PORT}/health"
+    while True:
+        await asyncio.sleep(600)  # 10 minutes
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=5) as resp:
+                    log.debug(f"Self-ping: {resp.status}")
+        except Exception as e:
+            log.debug(f"Self-ping failed: {e}")
+
+
 # --------------------------------------------------------------------------
-# Entrypoint
+# Error handler
 # --------------------------------------------------------------------------
 
-async def main():
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log errors and continue running."""
+    try:
+        err = context.error
+        if isinstance(err, (NetworkError, TimedOut)):
+            log.warning(f"Network error (will retry): {err}")
+            return
+        log.error(f"Exception while handling an update: {err}", exc_info=err)
+    except Exception as e:
+        log.error(f"Error handler itself failed: {e}")
+
+
+# --------------------------------------------------------------------------
+# Entrypoint with auto-recovery
+# --------------------------------------------------------------------------
+
+async def run_bot():
+    """Run the bot application once."""
     await init_db()
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .read_timeout(30)
+        .write_timeout(30)
+        .connect_timeout(30)
+        .pool_timeout(30)
+        .get_updates_read_timeout(40)
+        .get_updates_connect_timeout(15)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CallbackQueryHandler(callback_router))
@@ -1771,25 +1934,99 @@ async def main():
     application.add_handler(
         MessageHandler(filters.ALL & ~filters.COMMAND, text_and_moderation_handler)
     )
+    application.add_error_handler(error_handler)
 
     async with application:
         await application.start()
-        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        await application.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            poll_interval=1.0,
+            timeout=30,
+        )
 
         keep_alive_runner = None
         if KEEP_ALIVE_ENABLED:
             keep_alive_runner = await start_keep_alive_server()
 
-        log.info("Bot is up.")
+        ping_task = asyncio.create_task(self_ping())
+
+        log.info("✅ Bot is up and polling.")
+
+        # Watchdog: periodically check if polling is still alive
+        async def watchdog():
+            while True:
+                await asyncio.sleep(60)
+                try:
+                    if not (application.updater and application.updater.running):
+                        log.warning("⚠️ Watchdog: updater stopped! Restarting...")
+                        break
+                except Exception as e:
+                    log.error(f"Watchdog error: {e}")
+
+        watchdog_task = asyncio.create_task(watchdog())
+
         try:
             await asyncio.Event().wait()
         finally:
+            watchdog_task.cancel()
+            ping_task.cancel()
             if keep_alive_runner:
-                await keep_alive_runner.cleanup()
-            await application.updater.stop()
-            await application.stop()
-            await db.close()
+                try:
+                    await keep_alive_runner.cleanup()
+                except Exception:
+                    pass
+            try:
+                await application.updater.stop()
+            except Exception:
+                pass
+            try:
+                await application.stop()
+            except Exception:
+                pass
+            if db:
+                try:
+                    await db.close()
+                except Exception:
+                    pass
+
+
+async def run_bot_with_recovery():
+    """Run the bot with automatic recovery on failures."""
+    max_retries = 10
+    retry_delay = 10
+
+    for attempt in range(max_retries):
+        try:
+            log.info(f"🚀 Starting bot (attempt {attempt + 1}/{max_retries})...")
+            await run_bot()
+            log.info("Bot stopped normally")
+            return
+        except asyncio.CancelledError:
+            log.info("Bot cancelled")
+            raise
+        except Exception as e:
+            log.error(f"❌ Bot crashed: {type(e).__name__}: {e}", exc_info=True)
+            if attempt < max_retries - 1:
+                log.info(f"⏳ Restarting in {retry_delay} seconds...")
+                await asyncio.sleep(retry_delay)
+            else:
+                log.error("💀 Max retries reached, giving up")
+                raise
+
+
+def main():
+    """Entry point with signal handling."""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(run_bot_with_recovery())
+    except KeyboardInterrupt:
+        log.info("Bot stopped by user (KeyboardInterrupt)")
+    except Exception as e:
+        log.error(f"Fatal error: {e}", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
