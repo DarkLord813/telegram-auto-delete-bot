@@ -65,7 +65,7 @@ DEFAULT_BANNED_KEYWORDS = [
     "fuck", "shit", "asshole", "bitch", "cunt", "dick", "pussy",
     "penis", "vagina", "boobs", "tits", "cum", "semen", "orgasm",
     "masturbate", "incest", "rape", "drugs", "cocaine", "heroin",
-    "meth", "crack", "weed", "marijuana", "lsd", "mdma", "ecstasy"
+    "meth", "crack", "weed", "marijuana", "lsd", "mdma", "🔞",  "ecstasy"
 ]
 
 MANAGEABLE_TYPES = (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL)
@@ -258,11 +258,8 @@ async def list_all_approved(chat_id: int) -> list[dict]:
 
 
 async def is_approved_multi(chat_id: int, user_id: int | None, username: str | None,
-                             full_name: str | None) -> tuple[bool, str]:
-    """Approval check with fallbacks: exact user_id match first (authoritative),
-    then username, then display name — so a bot/admin approved by username
-    still gets recognized even if something about live ID matching doesn't
-    line up. Returns (approved, method) for logging."""
+                             full_name: str | None, signature: str | None = None) -> tuple[bool, str]:
+    """Approval check with fallbacks: user_id -> username -> signature -> display name."""
     if user_id is not None:
         cur = await db.execute(
             "SELECT 1 FROM approved_admins WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
@@ -280,6 +277,16 @@ async def is_approved_multi(chat_id: int, user_id: int | None, username: str | N
         if await cur.fetchone():
             await cur.close()
             return True, "username"
+        await cur.close()
+
+    if signature:
+        cur = await db.execute(
+            "SELECT 1 FROM approved_admins WHERE chat_id = ? AND signature = ? COLLATE NOCASE",
+            (chat_id, signature),
+        )
+        if await cur.fetchone():
+            await cur.close()
+            return True, "signature"
         await cur.close()
 
     if full_name:
@@ -1164,7 +1171,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             member = await context.bot.get_chat_member(target_chat_id, target_user_id)
             name = member.user.full_name or str(member.user.id)
             username = member.user.username
-            signature = member.custom_title
+            # Use custom_title if set, otherwise use the display name as signature
+            custom_title = member.custom_title
+            signature = custom_title or name
             is_bot = member.user.is_bot
         except TelegramError:
             name, username, signature, is_bot = str(target_user_id), None, None, False
@@ -1433,28 +1442,39 @@ async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFA
                 )
                 return
 
-            # Get user info
-            name = member.user.full_name or username
-            signature = member.custom_title
+            # Get the user's DISPLAY NAME (this is what appears in the channel)
+            display_name = member.user.full_name or username
+            
+            # Get custom title if set (custom title set in channel settings)
+            custom_title = member.custom_title
+            
+            # IMPORTANT: Use display name as signature for channel post matching
+            # This is what appears next to their posts in the channel
+            # If custom title is set, use that instead (it overrides the display)
+            signature = custom_title or display_name
+            
+            log.info(
+                f"Approving @{username}: display_name='{display_name}', "
+                f"custom_title='{custom_title}', using signature='{signature}'"
+            )
 
-            # Store approval with both user_id AND signature
+            # Store approval with user_id, name, AND signature (using display name)
             await approve_admin(
                 target_chat_id,
                 resolved.id,
-                name,
+                display_name,  # Store the display name
                 member.user.username,
-                signature,  # Store custom title for channel matching
+                signature,  # Use display name (or custom title) for channel matching
                 member.user.is_bot
             )
 
             kind = "bot" if member.user.is_bot else "admin"
-
-            # Build response
             response = f"✅ Approved @{username} ({kind}, ID: {resolved.id})"
-            if signature:
-                response += f"\n📝 Custom Title: '{signature}' (used for channel posts)"
+            
+            if custom_title:
+                response += f"\n📝 Using Custom Title: '{custom_title}' for channel posts"
             else:
-                response += f"\n📝 No custom title set. For channel posts, set a custom title first."
+                response += f"\n📝 Using display name: '{display_name}' for channel posts"
 
             await message.reply_text(response)
             return
@@ -1499,17 +1519,29 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Check if this is a channel post or anonymous group admin
     if message.sender_chat and message.sender_chat.id == chat.id:
-        # Channel post or anonymous group admin
+        # Channel post - the author_signature is what appears in the channel
         signature = message.author_signature
         sender_name = signature or "Anonymous"
         sender_id = message.sender_chat.id  # Channel ID (for reference only)
 
         if signature:
             is_admin = True  # Channel admins are always admins
+
+            # Check by signature first (this will match if custom title or display name was stored)
             is_approved_admin = await is_signature_approved(chat.id, signature)
-            log.info(f"Channel post: signature='{signature}', approved={is_approved_admin}")
+            if is_approved_admin:
+                log.info(f"✅ Channel admin '{signature}' approved by signature")
+            else:
+                # Fallback: check by signature as full_name
+                is_approved_admin, method = await is_approved_multi(
+                    chat.id, None, None, signature, signature
+                )
+                if is_approved_admin:
+                    log.info(f"✅ Channel admin '{signature}' approved via {method}")
+                else:
+                    log.info(f"❌ Channel admin '{signature}' NOT approved")
         else:
-            # No signature means we can't identify the admin
+            # No signature - can't identify the admin
             log.info("Channel post with no signature - cannot identify admin, leaving message")
             return
     elif message.from_user:
@@ -1522,33 +1554,22 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_admin = await user_is_chat_admin(context.bot, chat.id, sender_id)
 
         if is_admin:
-            # Check by user_id
+            # Check by user_id first
             is_approved_admin = await is_approved(chat.id, sender_id)
             if is_approved_admin:
                 log.info(f"✅ Admin {sender_id} approved by user_id")
             else:
-                # Check by username
-                if sender_username:
-                    approved_by_username = await is_approved_multi(chat.id, None, sender_username, None)
-                    if approved_by_username[0]:
-                        is_approved_admin = True
-                        # Add to approved list
-                        await approve_admin(
-                            chat.id, sender_id, sender_name, sender_username,
-                            None, message.from_user.is_bot
-                        )
-                        log.info(f"✅ Admin {sender_id} approved by username and added to DB")
-
-                # Check by full name
-                if not is_approved_admin and sender_name:
-                    approved_by_name = await is_approved_multi(chat.id, None, None, sender_name)
-                    if approved_by_name[0]:
-                        is_approved_admin = True
-                        await approve_admin(
-                            chat.id, sender_id, sender_name, sender_username,
-                            None, message.from_user.is_bot
-                        )
-                        log.info(f"✅ Admin {sender_id} approved by name and added to DB")
+                # Check by username, signature, or name
+                is_approved_admin, method = await is_approved_multi(
+                    chat.id, sender_id, sender_username, sender_name, None
+                )
+                if is_approved_admin:
+                    log.info(f"✅ Admin {sender_id} approved via {method} match")
+                    # Add the user_id to approved list for future
+                    await approve_admin(
+                        chat.id, sender_id, sender_name or str(sender_id),
+                        sender_username, sender_name, message.from_user.is_bot
+                    )
 
     log.info(f"📊 Message from {sender_name} (ID: {sender_id}): is_admin={is_admin}, is_approved_admin={is_approved_admin}")
 
@@ -1639,10 +1660,18 @@ async def delete_job(context: ContextTypes.DEFAULT_TYPE):
         if approved:
             log.info(f"⏭️ Scheduled delete skipped — signature was approved during delay")
             return
-    else:
-        # For regular users, check by user_id, username, or name
+        # Also check by signature as name
         approved, _method = await is_approved_multi(
-            chat_id, data.get("sender_id"), data.get("sender_username"), data.get("sender_name")
+            chat_id, None, None, data["signature"], data["signature"]
+        )
+        if approved:
+            log.info(f"⏭️ Scheduled delete skipped — signature approved via {_method}")
+            return
+    else:
+        # For regular users, check by user_id, username, signature, or name
+        approved, _method = await is_approved_multi(
+            chat_id, data.get("sender_id"), data.get("sender_username"),
+            data.get("sender_name"), None
         )
         if approved:
             log.info(f"⏭️ Scheduled delete skipped — user was approved during delay")
