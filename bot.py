@@ -55,6 +55,9 @@ logging.basicConfig(
     level=logging.DEBUG if DEBUG_MODE else logging.INFO,
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("httpcore.http11").setLevel(logging.WARNING)
+logging.getLogger("httpcore.connection").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 log = logging.getLogger("autodelete-bot")
@@ -100,6 +103,7 @@ CREATE TABLE IF NOT EXISTS approved_admins (
     name      TEXT,
     username  TEXT,
     signature TEXT,
+    custom_title TEXT,
     is_bot    INTEGER DEFAULT 0,
     admin_type TEXT DEFAULT 'member',
     PRIMARY KEY (chat_id, user_id)
@@ -252,7 +256,7 @@ def log_message_debug(prefix: str, message, extra: dict | None = None):
 
 
 # ==========================================================================
-# FLASK HEALTH SERVER (daemon thread)
+# FLASK HEALTH SERVER
 # ==========================================================================
 
 health_app = Flask(__name__)
@@ -291,6 +295,12 @@ async def init_db():
     global db
     db = await aiosqlite.connect(DATABASE_PATH)
     await db.executescript(SCHEMA)
+    try:
+        await db.execute("ALTER TABLE approved_admins ADD COLUMN custom_title TEXT")
+        await db.commit()
+        log.info("Added custom_title column to approved_admins")
+    except Exception:
+        pass
     await db.commit()
     log.info("Database initialized")
 
@@ -409,13 +419,20 @@ async def is_approved(chat_id: int, user_id: int) -> bool:
 async def list_all_approved(chat_id: int) -> list[dict]:
     try:
         cur = await db.execute(
-            "SELECT user_id, name, username, signature, is_bot FROM approved_admins WHERE chat_id = ?",
+            "SELECT user_id, name, username, signature, is_bot, custom_title FROM approved_admins WHERE chat_id = ?",
             (chat_id,),
         )
         rows = await cur.fetchall()
         await cur.close()
         return [
-            {"user_id": r[0], "name": r[1], "username": r[2], "signature": r[3], "is_bot": bool(r[4])}
+            {
+                "user_id": r[0],
+                "name": r[1],
+                "username": r[2],
+                "signature": r[3],
+                "is_bot": bool(r[4]),
+                "custom_title": r[5] if len(r) > 5 else None,
+            }
             for r in rows
         ]
     except Exception as e:
@@ -425,6 +442,7 @@ async def list_all_approved(chat_id: int) -> list[dict]:
 
 async def is_approved_multi(chat_id: int, user_id: int | None, username: str | None,
                              full_name: str | None, signature: str | None = None) -> tuple[bool, str]:
+    """Try ALL matching options in order."""
     try:
         if user_id is not None:
             cur = await db.execute("SELECT 1 FROM approved_admins WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
@@ -434,9 +452,10 @@ async def is_approved_multi(chat_id: int, user_id: int | None, username: str | N
             await cur.close()
 
         if username:
+            clean = username.lstrip("@").strip()
             cur = await db.execute(
-                "SELECT 1 FROM approved_admins WHERE chat_id = ? AND username = ? COLLATE NOCASE",
-                (chat_id, username.lstrip("@")),
+                "SELECT 1 FROM approved_admins WHERE chat_id = ? AND LOWER(username) = LOWER(?)",
+                (chat_id, clean),
             )
             if await cur.fetchone():
                 await cur.close()
@@ -445,7 +464,7 @@ async def is_approved_multi(chat_id: int, user_id: int | None, username: str | N
 
         if signature:
             cur = await db.execute(
-                "SELECT 1 FROM approved_admins WHERE chat_id = ? AND signature = ? COLLATE NOCASE",
+                "SELECT 1 FROM approved_admins WHERE chat_id = ? AND LOWER(signature) = LOWER(?)",
                 (chat_id, signature),
             )
             if await cur.fetchone():
@@ -453,9 +472,18 @@ async def is_approved_multi(chat_id: int, user_id: int | None, username: str | N
                 return True, "signature"
             await cur.close()
 
+            cur = await db.execute(
+                "SELECT 1 FROM approved_admins WHERE chat_id = ? AND LOWER(custom_title) = LOWER(?)",
+                (chat_id, signature),
+            )
+            if await cur.fetchone():
+                await cur.close()
+                return True, "custom_title"
+            await cur.close()
+
         if full_name:
             cur = await db.execute(
-                "SELECT 1 FROM approved_admins WHERE chat_id = ? AND name = ? COLLATE NOCASE",
+                "SELECT 1 FROM approved_admins WHERE chat_id = ? AND LOWER(name) = LOWER(?)",
                 (chat_id, full_name),
             )
             if await cur.fetchone():
@@ -468,15 +496,18 @@ async def is_approved_multi(chat_id: int, user_id: int | None, username: str | N
     return False, ""
 
 
-async def toggle_approved(chat_id: int, user_id: int, name: str, username: str | None, signature: str | None, is_bot: bool = False):
+async def toggle_approved(chat_id: int, user_id: int, name: str, username: str | None,
+                           signature: str | None, is_bot: bool = False,
+                           custom_title: str | None = None):
     try:
         if await is_approved(chat_id, user_id):
             await db.execute("DELETE FROM approved_admins WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
         else:
             await db.execute(
-                "INSERT OR REPLACE INTO approved_admins (chat_id, user_id, name, username, signature, is_bot) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (chat_id, user_id, name, username, signature, int(is_bot)),
+                "INSERT OR REPLACE INTO approved_admins "
+                "(chat_id, user_id, name, username, signature, custom_title, is_bot) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (chat_id, user_id, name, username, signature, custom_title, int(is_bot)),
             )
         await db.commit()
     except Exception as e:
@@ -488,15 +519,34 @@ async def is_signature_approved(chat_id: int, signature: str | None) -> bool:
         return False
     try:
         cur = await db.execute(
-            "SELECT 1 FROM approved_admins WHERE chat_id = ? AND signature = ? COLLATE NOCASE",
+            "SELECT 1 FROM approved_admins WHERE chat_id = ? AND LOWER(signature) = LOWER(?)",
             (chat_id, signature),
         )
-        row = await cur.fetchone()
+        if await cur.fetchone():
+            await cur.close()
+            return True
         await cur.close()
-        return row is not None
+
+        cur = await db.execute(
+            "SELECT 1 FROM approved_admins WHERE chat_id = ? AND LOWER(custom_title) = LOWER(?)",
+            (chat_id, signature),
+        )
+        if await cur.fetchone():
+            await cur.close()
+            return True
+        await cur.close()
+
+        cur = await db.execute(
+            "SELECT 1 FROM approved_admins WHERE chat_id = ? AND LOWER(name) = LOWER(?)",
+            (chat_id, signature),
+        )
+        if await cur.fetchone():
+            await cur.close()
+            return True
+        await cur.close()
     except Exception as e:
         log.error(f"is_signature_approved failed: {e}")
-        return False
+    return False
 
 
 async def list_keywords(chat_id: int) -> list[str]:
@@ -570,16 +620,23 @@ async def remove_whitelist_keyword_by_index(chat_id: int, index: int):
 
 
 async def approve_admin(chat_id: int, user_id: int, name: str, username: str | None,
-                         signature: str | None, is_bot: bool = False):
+                         signature: str | None, is_bot: bool = False,
+                         custom_title: str | None = None):
     await ensure_chat(chat_id)
     try:
         await db.execute(
-            "INSERT OR REPLACE INTO approved_admins (chat_id, user_id, name, username, signature, is_bot) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (chat_id, user_id, name, username, signature, int(is_bot)),
+            "INSERT OR REPLACE INTO approved_admins "
+            "(chat_id, user_id, name, username, signature, custom_title, is_bot) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, user_id, name, username, signature, custom_title, int(is_bot)),
         )
         await db.commit()
-        log.info(f"✅ Approved admin {user_id} (@{username}) signature '{signature}' in chat {chat_id}")
+        log.info(
+            f"✅ Approved admin {user_id} "
+            f"(@{username}) name='{name}' "
+            f"custom_title='{custom_title}' signature='{signature}' "
+            f"in chat {chat_id}"
+        )
     except Exception as e:
         log.error(f"approve_admin failed: {e}")
 
@@ -766,7 +823,7 @@ def fmt_delay(seconds: int) -> str:
 
 
 # --------------------------------------------------------------------------
-# Menu builders (shortened for brevity — same as before)
+# Menu builders
 # --------------------------------------------------------------------------
 
 async def main_menu_markup(chat_id: int, in_dm: bool, user_id: int) -> InlineKeyboardMarkup:
@@ -861,7 +918,7 @@ async def admins_menu_markup(bot, chat_id: int, page: int = 0) -> tuple[str, Inl
             "user_id": row["user_id"], "name": display, "full_name": name,
             "username": username, "approved": True, "is_bot": row["is_bot"],
             "is_self_bot": False, "status": "manual",
-            "custom_title": row["signature"] or "",
+            "custom_title": row.get("custom_title") or row.get("signature") or "",
         })
 
     admin_list.sort(key=lambda x: (
@@ -1038,7 +1095,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --------------------------------------------------------------------------
-# Track chats the bot is admin in
+# Track chats
 # --------------------------------------------------------------------------
 
 async def my_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1199,8 +1256,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             signature = custom_title or name
             is_bot = member.user.is_bot
         except TelegramError:
-            name, username, signature, is_bot = str(target_user_id), None, None, False
-        await toggle_approved(target_chat_id, target_user_id, name, username, signature, is_bot)
+            name, username, custom_title, signature, is_bot = str(target_user_id), None, None, None, False
+        await toggle_approved(target_chat_id, target_user_id, name, username, signature, is_bot, custom_title)
         text, markup = await admins_menu_markup(context.bot, target_chat_id, 0)
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
 
@@ -1439,17 +1496,29 @@ async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFA
                     failed.append(f"⚠️ @{username} — not an admin")
                     continue
 
-                display_name = member.user.full_name or username
+                full_name = member.user.full_name or username
                 custom_title = member.custom_title
-                signature = custom_title or display_name
+                signature = custom_title or full_name
 
                 await approve_admin(
-                    target_chat_id, resolved.id, display_name,
-                    member.user.username, signature, member.user.is_bot)
+                    chat_id=target_chat_id,
+                    user_id=resolved.id,
+                    name=full_name,
+                    username=member.user.username,
+                    signature=signature,
+                    is_bot=member.user.is_bot,
+                    custom_title=custom_title,
+                )
 
                 kind = "bot" if member.user.is_bot else "admin"
-                sig_info = f" (sig: '{signature}')" if custom_title else ""
-                approved.append(f"✅ @{username} ({kind}, ID: {resolved.id}){sig_info}")
+                details = [f"ID: {resolved.id}"]
+                if custom_title:
+                    details.append(f"title: '{custom_title}'")
+                if full_name:
+                    details.append(f"name: '{full_name}'")
+                if member.user.username:
+                    details.append(f"@{member.user.username}")
+                approved.append(f"✅ @{username} ({kind}) — " + ", ".join(details))
 
                 await asyncio.sleep(0.3)
 
@@ -1471,7 +1540,20 @@ async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFA
 
 
 # --------------------------------------------------------------------------
-# Moderate message — WITH FORWARD FIX
+# Moderate message — FINAL RULES
+# --------------------------------------------------------------------------
+#
+# Scenario                                       Action
+# ---------------------------------------------  ---------
+# Forwarded post from approved admin             KEEP
+# Forwarded post from non-approved admin         DELETE
+# Channel post without signature (anonymous)     KEEP
+# Original post from approved admin              KEEP
+# Original post from non-approved admin          DELETE
+# Regular member message                         Not touched
+#
+# In short: forwarding does NOT change the decision.
+# The approval status of the ORIGINAL sender is the only thing that matters.
 # --------------------------------------------------------------------------
 
 async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1499,7 +1581,6 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if message.from_user and message.from_user.id == bot_user.id:
         return
 
-    # Forward info
     fwd = get_forward_origin_info(message)
 
     is_admin = False
@@ -1509,46 +1590,66 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender_username = None
     sender_name = None
 
+    # ---------- Channel post / anonymous admin ----------
     if message.sender_chat and message.sender_chat.id == chat.id:
-        # Channel post
         signature = message.author_signature
         sender_name = signature or "Anonymous"
         sender_id = message.sender_chat.id
 
-        if signature:
-            is_admin = True
-            is_approved_admin = await is_signature_approved(chat.id, signature)
-            if not is_approved_admin:
-                is_approved_admin, method = await is_approved_multi(
-                    chat.id, None, None, signature, signature)
-                if is_approved_admin:
-                    log.info(f"✅ Channel admin '{signature}' approved via {method}")
-        else:
-            log.info("Channel post with no signature - leaving alone")
+        # RULE: channel post WITHOUT signature → KEEP (can't identify sender)
+        if not signature:
+            log.info("⏭️ Channel post without signature — keeping (anonymous)")
             return
+
+        is_admin = True
+        # Check approval by signature / custom_title / name
+        is_approved_admin = await is_signature_approved(chat.id, signature)
+        if is_approved_admin:
+            log.info(f"✅ Channel admin '{signature}' approved")
+        else:
+            is_approved_admin, method = await is_approved_multi(
+                chat.id, None, None, signature, signature)
+            if is_approved_admin:
+                log.info(f"✅ Channel admin '{signature}' approved via {method}")
+
+    # ---------- Regular user / bot (forwarded or original) ----------
     elif message.from_user:
         sender_id = message.from_user.id
         sender_username = message.from_user.username
         sender_name = message.from_user.full_name
 
-        is_admin = await user_is_chat_admin(context.bot, chat.id, sender_id)
+        # If it's a forward, use the ORIGINAL sender for the approval check
+        check_id = sender_id
+        check_username = sender_username
+        check_name = sender_name
+
+        if fwd["is_forward"]:
+            log.info(f"🔄 Forward detected — original sender: "
+                     f"id={fwd['original_sender_id']} "
+                     f"name={fwd['original_sender_name']!r} "
+                     f"@{fwd['original_sender_username']}")
+            if fwd["original_sender_id"]:
+                check_id = fwd["original_sender_id"]
+                check_username = fwd["original_sender_username"]
+                check_name = fwd["original_sender_name"]
+
+        # Is the original sender an admin of this chat?
+        is_admin = await user_is_chat_admin(context.bot, chat.id, check_id)
 
         if is_admin:
-            is_approved_admin = await is_approved(chat.id, sender_id)
-            if not is_approved_admin:
-                # Check by forward origin too (if forwarded from an approved admin)
-                if fwd["is_forward"] and fwd["original_sender_id"]:
-                    is_approved_admin = await is_approved(chat.id, fwd["original_sender_id"])
-                    if is_approved_admin:
-                        log.info(f"✅ Forward from approved admin {fwd['original_sender_id']}")
-                if not is_approved_admin:
-                    is_approved_admin, method = await is_approved_multi(
-                        chat.id, sender_id, sender_username, sender_name, None)
-                    if is_approved_admin:
-                        log.info(f"✅ Admin {sender_id} approved via {method}")
-                        await approve_admin(
-                            chat.id, sender_id, sender_name or str(sender_id),
-                            sender_username, sender_name, message.from_user.is_bot)
+            # Try all matching options
+            is_approved_admin = await is_approved(chat.id, check_id)
+            if is_approved_admin:
+                log.info(f"✅ Admin {check_id} approved by user_id")
+            else:
+                is_approved_admin, method = await is_approved_multi(
+                    chat.id, check_id, check_username, check_name, None)
+                if is_approved_admin:
+                    log.info(f"✅ Admin {check_id} approved via {method}")
+                    # Backfill user_id for future fast matching
+                    await approve_admin(
+                        chat.id, check_id, check_name or str(check_id),
+                        check_username, check_name, False, None)
 
     log_message_debug(
         "📊 MODERATION CHECK",
@@ -1556,20 +1657,19 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         extra={
             "is_admin": is_admin,
             "is_approved_admin": is_approved_admin,
+            "is_forward": fwd["is_forward"],
             "signature": signature,
             "sender_id": sender_id,
-            "settings": settings,
+            "check_id": locals().get("check_id"),
         }
     )
 
+    # Only moderate admins
     if not is_admin:
-        log.info(f"⏭️ Not an admin - skipping moderation")
+        log.info(f"⏭️ Not an admin — skipping")
         return
 
-    if is_approved_admin:
-        log.info(f"✅ Admin is approved - NOT deleting")
-        return
-
+    # Build sender label
     parts_label = []
     if sender_name:
         parts_label.append(sender_name)
@@ -1579,15 +1679,15 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts_label.append(f"ID: {sender_id}")
     sender_label = " / ".join(parts_label)
 
-    # Whitelist
+    # Whitelist check
     if text:
         lowered = text.lower()
         for wl in await list_whitelist(chat.id):
             if wl in lowered:
-                log.info(f"📝 Whitelist match - keeping message")
+                log.info(f"📝 Whitelist match '{wl}' — keeping message")
                 return
 
-    # Blacklist
+    # Blacklist check
     if text:
         lowered = text.lower()
         for kw in await list_keywords(chat.id):
@@ -1602,14 +1702,20 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     log.warning(f"Delete failed: {e}")
                     return
 
-    # Non-approved admin — delete
+    # RULE: if approved admin (original OR forwarded) → KEEP
+    if is_approved_admin:
+        log.info(f"✅ Approved admin — KEEPING (forwarded={fwd['is_forward']})")
+        return
+
+    # Non-approved admin → DELETE
+    reason = "forwarded post from non-approved admin" if fwd["is_forward"] else "non-approved admin"
     delay = settings["delete_delay"]
     if delay <= 0:
         try:
             await message.delete()
-            log.info(f"🗑️ Deleted immediately")
+            log.info(f"🗑️ Deleted immediately ({reason})")
             await notify_deletion(context, chat.id, chat.title or str(chat.id),
-                                  sender_label, "non-approved admin", text)
+                                  sender_label, reason, text)
         except TelegramError as e:
             log.warning(f"Delete failed: {e}")
     else:
@@ -1622,40 +1728,50 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "sender_id": sender_id,
                 "sender_username": sender_username,
                 "sender_name": sender_name,
+                "check_id": locals().get("check_id"),
+                "check_username": locals().get("check_username"),
+                "check_name": locals().get("check_name"),
                 "signature": signature,
                 "snippet": text,
+                "reason": reason,
             })
-        log.info(f"⏰ Scheduled deletion (delay={delay}s)")
+        log.info(f"⏰ Scheduled deletion ({reason}, delay={delay}s)")
 
 
 async def delete_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
     chat_id = data["chat_id"]
 
+    # Re-check approval (using the ORIGINAL sender for forwards)
     approved = False
     if data.get("signature"):
         approved = await is_signature_approved(chat_id, data["signature"])
         if not approved:
-            approved, _ = await is_approved_multi(chat_id, None, None, data["signature"], data["signature"])
+            approved, _ = await is_approved_multi(
+                chat_id, None, None, data["signature"], data["signature"])
     else:
         approved, _ = await is_approved_multi(
-            chat_id, data.get("sender_id"), data.get("sender_username"),
-            data.get("sender_name"), None)
+            chat_id,
+            data.get("check_id") or data.get("sender_id"),
+            data.get("check_username") or data.get("sender_username"),
+            data.get("check_name") or data.get("sender_name"),
+            None)
 
     if approved:
-        log.info(f"⏭️ Skipped - approved during delay")
+        log.info(f"⏭️ Skipped — approved during delay")
         return
 
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=data["message_id"])
-        log.info(f"✅ Scheduled deletion executed")
+        reason = data.get("reason", "non-approved admin")
+        log.info(f"✅ Scheduled deletion executed ({reason})")
         parts = []
         if data.get("sender_name"): parts.append(data["sender_name"])
         if data.get("sender_username"): parts.append(f"@{data['sender_username']}")
         if data.get("signature"): parts.append(f"Sig: {data['signature']}")
         if data.get("sender_id"): parts.append(f"ID: {data['sender_id']}")
         await notify_deletion(context, chat_id, data.get("chat_title", str(chat_id)),
-                              " / ".join(parts), "non-approved admin", data.get("snippet", ""))
+                              " / ".join(parts), reason, data.get("snippet", ""))
     except TelegramError as e:
         log.info(f"⏭️ Delete skipped ({e})")
 
@@ -1683,14 +1799,14 @@ async def notify_deletion(context, chat_id, chat_title, sender_label, reason, sn
 
 
 # --------------------------------------------------------------------------
-# Error handler — CRITICAL for auto-recovery
+# Error handler
 # --------------------------------------------------------------------------
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     err = context.error
     if isinstance(err, Conflict):
         log.error(f"💥 CONFLICT: Another instance is polling! Force-restarting...")
-        os._exit(1)  # Force process restart — Render will spin up a fresh dyno
+        os._exit(1)
     if isinstance(err, (NetworkError, TimedOut)):
         log.warning(f"⚠️ Network error (will retry): {err}")
         return
@@ -1734,7 +1850,6 @@ async def run_bot():
         )
         log.info("✅ Bot is up and polling.")
 
-        # Watchdog — ACTIVE Telegram ping
         async def watchdog():
             failures = 0
             while True:
