@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import time
 import inspect
 import threading
@@ -147,6 +148,42 @@ CREATE TABLE IF NOT EXISTS all_admins (
 
 
 # ==========================================================================
+# KEYWORD MATCHING — EXACT WORD BOUNDARY
+# ==========================================================================
+
+def _build_keyword_pattern(keyword: str) -> re.Pattern:
+    """
+    Build a regex pattern that matches the keyword as a WHOLE WORD.
+
+    Rules:
+      - If keyword contains non-word chars (like "18+"), use a stricter
+        boundary that checks for whitespace/punctuation on both sides.
+      - If keyword is purely alphanumeric (like "meth"), use \\b word
+        boundaries so "meth" matches "meth" but NOT "something".
+
+    Examples:
+      "meth"  → matches "meth", "METH", "meth." → NOT "something", "method"
+      "18+"   → matches "18+" → NOT "180", "18"
+      "free money" → matches "free money" → NOT "freedom oney"
+    """
+    escaped = re.escape(keyword)
+    if re.match(r'^\w+$', keyword):
+        # Purely alphanumeric → use word boundaries
+        pattern = rf'\b{escaped}\b'
+    else:
+        # Contains special chars → require non-word or string boundary around it
+        pattern = rf'(?<!\w){escaped}(?!\w)'
+    return re.compile(pattern, re.IGNORECASE)
+
+
+def keyword_matches(keyword: str, text: str) -> bool:
+    """Return True if `keyword` appears as a WHOLE WORD in `text`."""
+    if not keyword or not text:
+        return False
+    return bool(_build_keyword_pattern(keyword).search(text))
+
+
+# ==========================================================================
 # DEBUG HELPERS
 # ==========================================================================
 
@@ -256,7 +293,7 @@ def log_message_debug(prefix: str, message, extra: dict | None = None):
 
 
 # ==========================================================================
-# FLASK HEALTH SERVER
+# FLASK HEALTH SERVER (daemon thread)
 # ==========================================================================
 
 health_app = Flask(__name__)
@@ -995,7 +1032,13 @@ async def keywords_menu_markup(chat_id: int) -> tuple[str, InlineKeyboardMarkup]
         rows.append([InlineKeyboardButton(f"❌ {kw}", callback_data=f"kd:{chat_id}:{i}")])
     rows.append([InlineKeyboardButton("➕ Add Keyword(s)", callback_data=f"ka:{chat_id}")])
     rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"menu:{chat_id}")])
-    text = "*🚫 Blacklist*\n\nMultiple keywords: one per line.\n\n"
+    text = (
+        "*🚫 Blacklist*\n\n"
+        "🔍 *Matching:* EXACT WORD only.\n"
+        "• `meth` matches standalone `meth` ✅\n"
+        "• `meth` does NOT match `something` ❌\n\n"
+        "Multiple keywords: one per line.\n\n"
+    )
     text += ("Current: " + ", ".join(kws)) if kws else "_No blacklist keywords yet._"
     return text, InlineKeyboardMarkup(rows)
 
@@ -1007,7 +1050,11 @@ async def whitelist_menu_markup(chat_id: int) -> tuple[str, InlineKeyboardMarkup
         rows.append([InlineKeyboardButton(f"❌ {kw}", callback_data=f"wd:{chat_id}:{i}")])
     rows.append([InlineKeyboardButton("➕ Add Keyword(s)", callback_data=f"wa:{chat_id}")])
     rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"menu:{chat_id}")])
-    text = "*✅ Whitelist*\n\nMultiple keywords: one per line.\n\n"
+    text = (
+        "*✅ Whitelist*\n\n"
+        "🔍 *Matching:* EXACT WORD only.\n\n"
+        "Multiple keywords: one per line.\n\n"
+    )
     text += ("Current: " + ", ".join(kws)) if kws else "_No whitelist keywords yet._"
     return text, InlineKeyboardMarkup(rows)
 
@@ -1290,7 +1337,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "ka":
         PENDING_INPUT[(reply_chat.id, user.id)] = ("add_keyword", target_chat_id)
         await query.edit_message_text(
-            "✏️ Send keyword(s) to blacklist. One per line for multiple.",
+            "✏️ Send keyword(s) to blacklist. One per line for multiple.\n\n"
+            "🔍 Matched as *exact words only* (e.g. `meth` won't match `something`).",
+            parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🔙 Cancel", callback_data=f"kw:{target_chat_id}")]]))
 
@@ -1307,7 +1356,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "wa":
         PENDING_INPUT[(reply_chat.id, user.id)] = ("add_whitelist", target_chat_id)
         await query.edit_message_text(
-            "✏️ Send keyword(s) to whitelist. One per line for multiple.",
+            "✏️ Send keyword(s) to whitelist. One per line for multiple.\n\n"
+            "🔍 Matched as *exact words only*.",
+            parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🔙 Cancel", callback_data=f"wl:{target_chat_id}")]]))
 
@@ -1540,20 +1591,7 @@ async def text_and_moderation_handler(update: Update, context: ContextTypes.DEFA
 
 
 # --------------------------------------------------------------------------
-# Moderate message — FINAL RULES
-# --------------------------------------------------------------------------
-#
-# Scenario                                       Action
-# ---------------------------------------------  ---------
-# Forwarded post from approved admin             KEEP
-# Forwarded post from non-approved admin         DELETE
-# Channel post without signature (anonymous)     KEEP
-# Original post from approved admin              KEEP
-# Original post from non-approved admin          DELETE
-# Regular member message                         Not touched
-#
-# In short: forwarding does NOT change the decision.
-# The approval status of the ORIGINAL sender is the only thing that matters.
+# Moderate message
 # --------------------------------------------------------------------------
 
 async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1589,6 +1627,9 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender_id = None
     sender_username = None
     sender_name = None
+    check_id = None
+    check_username = None
+    check_name = None
 
     # ---------- Channel post / anonymous admin ----------
     if message.sender_chat and message.sender_chat.id == chat.id:
@@ -1596,13 +1637,12 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sender_name = signature or "Anonymous"
         sender_id = message.sender_chat.id
 
-        # RULE: channel post WITHOUT signature → KEEP (can't identify sender)
+        # RULE: channel post WITHOUT signature → KEEP (anonymous, can't identify)
         if not signature:
             log.info("⏭️ Channel post without signature — keeping (anonymous)")
             return
 
         is_admin = True
-        # Check approval by signature / custom_title / name
         is_approved_admin = await is_signature_approved(chat.id, signature)
         if is_approved_admin:
             log.info(f"✅ Channel admin '{signature}' approved")
@@ -1618,26 +1658,21 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sender_username = message.from_user.username
         sender_name = message.from_user.full_name
 
-        # If it's a forward, use the ORIGINAL sender for the approval check
         check_id = sender_id
         check_username = sender_username
         check_name = sender_name
 
-        if fwd["is_forward"]:
-            log.info(f"🔄 Forward detected — original sender: "
-                     f"id={fwd['original_sender_id']} "
-                     f"name={fwd['original_sender_name']!r} "
-                     f"@{fwd['original_sender_username']}")
-            if fwd["original_sender_id"]:
-                check_id = fwd["original_sender_id"]
-                check_username = fwd["original_sender_username"]
-                check_name = fwd["original_sender_name"]
+        if fwd["is_forward"] and fwd["original_sender_id"]:
+            log.info(f"🔄 Forward — using original sender "
+                     f"id={fwd['original_sender_id']} name={fwd['original_sender_name']!r}")
+            check_id = fwd["original_sender_id"]
+            check_username = fwd["original_sender_username"]
+            check_name = fwd["original_sender_name"]
 
-        # Is the original sender an admin of this chat?
+        # Is the (original) sender an admin?
         is_admin = await user_is_chat_admin(context.bot, chat.id, check_id)
 
         if is_admin:
-            # Try all matching options
             is_approved_admin = await is_approved(chat.id, check_id)
             if is_approved_admin:
                 log.info(f"✅ Admin {check_id} approved by user_id")
@@ -1646,7 +1681,6 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat.id, check_id, check_username, check_name, None)
                 if is_approved_admin:
                     log.info(f"✅ Admin {check_id} approved via {method}")
-                    # Backfill user_id for future fast matching
                     await approve_admin(
                         chat.id, check_id, check_name or str(check_id),
                         check_username, check_name, False, None)
@@ -1660,16 +1694,14 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "is_forward": fwd["is_forward"],
             "signature": signature,
             "sender_id": sender_id,
-            "check_id": locals().get("check_id"),
+            "check_id": check_id,
         }
     )
 
-    # Only moderate admins
     if not is_admin:
         log.info(f"⏭️ Not an admin — skipping")
         return
 
-    # Build sender label
     parts_label = []
     if sender_name:
         parts_label.append(sender_name)
@@ -1679,22 +1711,20 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts_label.append(f"ID: {sender_id}")
     sender_label = " / ".join(parts_label)
 
-    # Whitelist check
+    # Whitelist — EXACT WORD matching
     if text:
-        lowered = text.lower()
         for wl in await list_whitelist(chat.id):
-            if wl in lowered:
-                log.info(f"📝 Whitelist match '{wl}' — keeping message")
+            if keyword_matches(wl, text):
+                log.info(f"📝 Whitelist exact-word match '{wl}' — keeping message")
                 return
 
-    # Blacklist check
+    # Blacklist — EXACT WORD matching
     if text:
-        lowered = text.lower()
         for kw in await list_keywords(chat.id):
-            if kw in lowered:
+            if keyword_matches(kw, text):
                 try:
                     await message.delete()
-                    log.info(f"🗑️ Deleted keyword '{kw}'")
+                    log.info(f"🗑️ Deleted exact-word '{kw}'")
                     await notify_deletion(context, chat.id, chat.title or str(chat.id),
                                           sender_label, f"blacklisted keyword: {kw}", text)
                     return
@@ -1702,12 +1732,10 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     log.warning(f"Delete failed: {e}")
                     return
 
-    # RULE: if approved admin (original OR forwarded) → KEEP
     if is_approved_admin:
         log.info(f"✅ Approved admin — KEEPING (forwarded={fwd['is_forward']})")
         return
 
-    # Non-approved admin → DELETE
     reason = "forwarded post from non-approved admin" if fwd["is_forward"] else "non-approved admin"
     delay = settings["delete_delay"]
     if delay <= 0:
@@ -1728,9 +1756,9 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "sender_id": sender_id,
                 "sender_username": sender_username,
                 "sender_name": sender_name,
-                "check_id": locals().get("check_id"),
-                "check_username": locals().get("check_username"),
-                "check_name": locals().get("check_name"),
+                "check_id": check_id,
+                "check_username": check_username,
+                "check_name": check_name,
                 "signature": signature,
                 "snippet": text,
                 "reason": reason,
@@ -1742,7 +1770,6 @@ async def delete_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
     chat_id = data["chat_id"]
 
-    # Re-check approval (using the ORIGINAL sender for forwards)
     approved = False
     if data.get("signature"):
         approved = await is_signature_approved(chat_id, data["signature"])
