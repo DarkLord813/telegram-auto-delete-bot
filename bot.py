@@ -152,32 +152,15 @@ CREATE TABLE IF NOT EXISTS all_admins (
 # ==========================================================================
 
 def _build_keyword_pattern(keyword: str) -> re.Pattern:
-    """
-    Build a regex pattern that matches the keyword as a WHOLE WORD.
-
-    Rules:
-      - If keyword contains non-word chars (like "18+"), use a stricter
-        boundary that checks for whitespace/punctuation on both sides.
-      - If keyword is purely alphanumeric (like "meth"), use \\b word
-        boundaries so "meth" matches "meth" but NOT "something".
-
-    Examples:
-      "meth"  → matches "meth", "METH", "meth." → NOT "something", "method"
-      "18+"   → matches "18+" → NOT "180", "18"
-      "free money" → matches "free money" → NOT "freedom oney"
-    """
     escaped = re.escape(keyword)
     if re.match(r'^\w+$', keyword):
-        # Purely alphanumeric → use word boundaries
         pattern = rf'\b{escaped}\b'
     else:
-        # Contains special chars → require non-word or string boundary around it
         pattern = rf'(?<!\w){escaped}(?!\w)'
     return re.compile(pattern, re.IGNORECASE)
 
 
 def keyword_matches(keyword: str, text: str) -> bool:
-    """Return True if `keyword` appears as a WHOLE WORD in `text`."""
     if not keyword or not text:
         return False
     return bool(_build_keyword_pattern(keyword).search(text))
@@ -188,7 +171,6 @@ def keyword_matches(keyword: str, text: str) -> bool:
 # ==========================================================================
 
 def get_forward_origin_info(message) -> dict:
-    """Extract forward info from a message (Bot API 7.0+ and legacy)."""
     info = {
         "is_forward": False,
         "original_sender_id": None,
@@ -239,7 +221,6 @@ def get_forward_origin_info(message) -> dict:
 
 
 def log_message_debug(prefix: str, message, extra: dict | None = None):
-    """Log ALL fields of a message for debugging."""
     if not DEBUG_MODE:
         return
 
@@ -293,7 +274,7 @@ def log_message_debug(prefix: str, message, extra: dict | None = None):
 
 
 # ==========================================================================
-# FLASK HEALTH SERVER (daemon thread)
+# FLASK HEALTH SERVER
 # ==========================================================================
 
 health_app = Flask(__name__)
@@ -479,7 +460,6 @@ async def list_all_approved(chat_id: int) -> list[dict]:
 
 async def is_approved_multi(chat_id: int, user_id: int | None, username: str | None,
                              full_name: str | None, signature: str | None = None) -> tuple[bool, str]:
-    """Try ALL matching options in order."""
     try:
         if user_id is not None:
             cur = await db.execute("SELECT 1 FROM approved_admins WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
@@ -1052,7 +1032,9 @@ async def whitelist_menu_markup(chat_id: int) -> tuple[str, InlineKeyboardMarkup
     rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"menu:{chat_id}")])
     text = (
         "*✅ Whitelist*\n\n"
-        "🔍 *Matching:* EXACT WORD only.\n\n"
+        "🔍 *Matching:* EXACT WORD only.\n"
+        "ℹ️ Only protects messages from *non-admins* (regular members).\n"
+        "Admins must still be approved to keep their posts.\n\n"
         "Multiple keywords: one per line.\n\n"
     )
     text += ("Current: " + ", ".join(kws)) if kws else "_No whitelist keywords yet._"
@@ -1637,7 +1619,7 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sender_name = signature or "Anonymous"
         sender_id = message.sender_chat.id
 
-        # RULE: channel post WITHOUT signature → KEEP (anonymous, can't identify)
+        # RULE: channel post WITHOUT signature → KEEP
         if not signature:
             log.info("⏭️ Channel post without signature — keeping (anonymous)")
             return
@@ -1658,18 +1640,19 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sender_username = message.from_user.username
         sender_name = message.from_user.full_name
 
-        check_id = sender_id
-        check_username = sender_username
-        check_name = sender_name
-
+        # For forwards: use the ORIGINAL sender for admin check
         if fwd["is_forward"] and fwd["original_sender_id"]:
             log.info(f"🔄 Forward — using original sender "
                      f"id={fwd['original_sender_id']} name={fwd['original_sender_name']!r}")
             check_id = fwd["original_sender_id"]
             check_username = fwd["original_sender_username"]
             check_name = fwd["original_sender_name"]
+        else:
+            check_id = sender_id
+            check_username = sender_username
+            check_name = sender_name
 
-        # Is the (original) sender an admin?
+        # Is the ORIGINAL sender an admin?
         is_admin = await user_is_chat_admin(context.bot, chat.id, check_id)
 
         if is_admin:
@@ -1698,10 +1681,12 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
     )
 
+    # Only moderate admins
     if not is_admin:
         log.info(f"⏭️ Not an admin — skipping")
         return
 
+    # Build sender label
     parts_label = []
     if sender_name:
         parts_label.append(sender_name)
@@ -1711,20 +1696,13 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts_label.append(f"ID: {sender_id}")
     sender_label = " / ".join(parts_label)
 
-    # Whitelist — EXACT WORD matching
-    if text:
-        for wl in await list_whitelist(chat.id):
-            if keyword_matches(wl, text):
-                log.info(f"📝 Whitelist exact-word match '{wl}' — keeping message")
-                return
-
-    # Blacklist — EXACT WORD matching
+    # Blacklist — exact-word match, applies to ANY admin
     if text:
         for kw in await list_keywords(chat.id):
             if keyword_matches(kw, text):
                 try:
                     await message.delete()
-                    log.info(f"🗑️ Deleted exact-word '{kw}'")
+                    log.info(f"🗑️ Deleted exact-word '{kw}' from admin {sender_id}")
                     await notify_deletion(context, chat.id, chat.title or str(chat.id),
                                           sender_label, f"blacklisted keyword: {kw}", text)
                     return
@@ -1732,16 +1710,31 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     log.warning(f"Delete failed: {e}")
                     return
 
+    # Whitelist — only protects NON-admin messages.
+    # (Since we already returned for non-admins, this is moot here, but
+    # keeping it for safety / symmetry with older code.)
+    if text and not is_admin:
+        for wl in await list_whitelist(chat.id):
+            if keyword_matches(wl, text):
+                log.info(f"📝 Whitelist exact-word match '{wl}' — keeping regular member message")
+                return
+
+    # Approved admin → KEEP
     if is_approved_admin:
         log.info(f"✅ Approved admin — KEEPING (forwarded={fwd['is_forward']})")
         return
 
-    reason = "forwarded post from non-approved admin" if fwd["is_forward"] else "non-approved admin"
+    # Non-approved admin → DELETE (regardless of forward or original)
+    if fwd["is_forward"]:
+        reason = "forwarded post from non-approved admin"
+    else:
+        reason = "non-approved admin"
+
     delay = settings["delete_delay"]
     if delay <= 0:
         try:
             await message.delete()
-            log.info(f"🗑️ Deleted immediately ({reason})")
+            log.info(f"🗑️ Deleted immediately ({reason}) from admin {sender_id}")
             await notify_deletion(context, chat.id, chat.title or str(chat.id),
                                   sender_label, reason, text)
         except TelegramError as e:
@@ -1763,13 +1756,14 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "snippet": text,
                 "reason": reason,
             })
-        log.info(f"⏰ Scheduled deletion ({reason}, delay={delay}s)")
+        log.info(f"⏰ Scheduled deletion ({reason}, delay={delay}s) for admin {sender_id}")
 
 
 async def delete_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
     chat_id = data["chat_id"]
 
+    # Re-check approval using the ORIGINAL sender
     approved = False
     if data.get("signature"):
         approved = await is_signature_approved(chat_id, data["signature"])
