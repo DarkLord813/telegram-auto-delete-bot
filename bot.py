@@ -6,10 +6,12 @@ import time
 import inspect
 import threading
 import sys
+import urllib.request
+import urllib.error
 from typing import List, Dict, Any, Optional
 
 import aiosqlite
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from telegram import (
     InlineKeyboardButton,
@@ -44,6 +46,11 @@ KEEP_ALIVE_ENABLED = os.getenv("KEEP_ALIVE_ENABLED", "true").lower() == "true"
 DEFAULT_DELETE_DELAY = int(os.getenv("DEFAULT_DELETE_DELAY", "300"))
 
 DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"
+
+# Self-ping config (keeps Render free tier awake)
+SELF_PING_ENABLED = os.getenv("SELF_PING_ENABLED", "true").lower() == "true"
+SELF_PING_INTERVAL = int(os.getenv("SELF_PING_INTERVAL", "300"))  # 5 minutes
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")  # auto-set by Render
 
 WATCHDOG_INTERVAL = 90
 WATCHDOG_MAX_FAILURES = 3
@@ -145,6 +152,132 @@ CREATE TABLE IF NOT EXISTS all_admins (
     PRIMARY KEY (chat_id, user_id)
 );
 """
+
+
+# ==========================================================================
+# KEEP-ALIVE — Flask health server + self-pinger
+# ==========================================================================
+
+health_app = Flask(__name__)
+_start_time = time.time()
+_self_ping_count = 0
+_self_ping_last_ok: float = 0
+_self_ping_last_error: str = ""
+
+
+@health_app.route('/')
+@health_app.route('/health')
+@health_app.route('/health/')
+def health_check():
+    return "OK", 200
+
+
+@health_app.route('/ping')
+def ping_endpoint():
+    """Lightweight endpoint used by the self-pinger."""
+    global _self_ping_count, _self_ping_last_ok
+    _self_ping_count += 1
+    _self_ping_last_ok = time.time()
+    return f"pong #{_self_ping_count}", 200
+
+
+@health_app.route('/status')
+def status_check():
+    """Full status endpoint with uptime and ping stats."""
+    return jsonify({
+        "status": "ok",
+        "uptime_seconds": int(time.time() - _start_time),
+        "self_ping_count": _self_ping_count,
+        "self_ping_last_ok": _self_ping_last_ok,
+        "self_ping_last_error": _self_ping_last_error or None,
+        "port": PORT,
+    }), 200
+
+
+@health_app.errorhandler(404)
+def not_found(e):
+    if request.path.startswith('/health'):
+        return "OK", 200
+    return "Not Found", 404
+
+
+def run_health_server():
+    """Run Flask in its own daemon thread — separate from the bot's event loop."""
+    log.info(f"✅ Health check server starting on port {PORT}")
+    try:
+        health_app.run(
+            host='0.0.0.0',
+            port=PORT,
+            debug=False,
+            use_reloader=False,
+            threaded=True,
+        )
+    except Exception as e:
+        log.error(f"❌ Health server crashed: {e}")
+
+
+def _self_ping_loop():
+    """
+    Internal self-pinger.
+    Hits /ping every SELF_PING_INTERVAL seconds so Render's free tier
+    sees regular inbound traffic and doesn't spin the service down.
+    """
+    global _self_ping_last_error
+
+    # Try a few common URL shapes — Render usually provides RENDER_EXTERNAL_URL
+    base_url = RENDER_EXTERNAL_URL.rstrip("/") if RENDER_EXTERNAL_URL else ""
+    urls_to_try = []
+    if base_url:
+        urls_to_try.append(f"{base_url}/ping")
+    # Fallbacks (used only if RENDER_EXTERNAL_URL isn't set)
+    urls_to_try.append(f"http://localhost:{PORT}/ping")
+    urls_to_try.append(f"http://127.0.0.1:{PORT}/ping")
+
+    log.info(
+        f"🔁 Self-pinger started (every {SELF_PING_INTERVAL}s). "
+        f"Primary URL: {urls_to_try[0]}"
+    )
+
+    while True:
+        time.sleep(SELF_PING_INTERVAL)
+        success = False
+        for url in urls_to_try:
+            try:
+                with urllib.request.urlopen(url, timeout=15) as resp:
+                    if resp.status == 200:
+                        log.info(f"🏓 Self-ping OK → {url}")
+                        success = True
+                        _self_ping_last_error = ""
+                        break
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+                _self_ping_last_error = last_err
+                log.debug(f"Self-ping failed → {url} ({last_err})")
+        if not success:
+            log.warning(
+                f"⚠️ Self-ping failed on all URLs. "
+                f"Last error: {_self_ping_last_error}"
+            )
+
+
+def start_keep_alive():
+    """Start Flask health server + internal self-pinger (both in daemon threads)."""
+    if not KEEP_ALIVE_ENABLED:
+        log.info("ℹ️ Keep-alive disabled (KEEP_ALIVE_ENABLED=false)")
+        return
+
+    # 1. Flask health server (inbound endpoint for Render)
+    threading.Thread(target=run_health_server, daemon=True).start()
+    log.info(f"✅ Health server thread started on port {PORT}")
+
+    # 2. Internal self-pinger (keeps Render free tier awake)
+    if SELF_PING_ENABLED:
+        threading.Thread(target=_self_ping_loop, daemon=True).start()
+        log.info(
+            f"✅ Self-pinger thread started (interval: {SELF_PING_INTERVAL}s)"
+        )
+    else:
+        log.info("ℹ️ Self-pinger disabled (SELF_PING_ENABLED=false)")
 
 
 # ==========================================================================
@@ -271,38 +404,6 @@ def log_message_debug(prefix: str, message, extra: dict | None = None):
     if extra:
         for k, v in extra.items():
             log.info(f"    {k}={v!r}")
-
-
-# ==========================================================================
-# FLASK HEALTH SERVER
-# ==========================================================================
-
-health_app = Flask(__name__)
-_start_time = time.time()
-
-
-@health_app.route('/')
-@health_app.route('/health')
-@health_app.route('/health/')
-def health_check():
-    return "OK", 200
-
-
-@health_app.route('/status')
-def status_check():
-    return {"status": "ok", "uptime_seconds": int(time.time() - _start_time)}, 200
-
-
-@health_app.errorhandler(404)
-def not_found(e):
-    if request.path.startswith('/health'):
-        return "OK", 200
-    return "Not Found", 404
-
-
-def run_health_server():
-    log.info(f"✅ Health check server starting on port {PORT}")
-    health_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False, threaded=True)
 
 
 # --------------------------------------------------------------------------
@@ -1636,23 +1737,25 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------- Regular user / bot (forwarded or original) ----------
     elif message.from_user:
+        # The FORWARDER — the admin who posted this into the chat.
+        # Whether forward or original, this is who we moderate.
         sender_id = message.from_user.id
         sender_username = message.from_user.username
         sender_name = message.from_user.full_name
 
-        # For forwards: use the ORIGINAL sender for admin check
-        if fwd["is_forward"] and fwd["original_sender_id"]:
-            log.info(f"🔄 Forward — using original sender "
-                     f"id={fwd['original_sender_id']} name={fwd['original_sender_name']!r}")
-            check_id = fwd["original_sender_id"]
-            check_username = fwd["original_sender_username"]
-            check_name = fwd["original_sender_name"]
-        else:
-            check_id = sender_id
-            check_username = sender_username
-            check_name = sender_name
+        check_id = sender_id
+        check_username = sender_username
+        check_name = sender_name
 
-        # Is the ORIGINAL sender an admin?
+        if fwd["is_forward"]:
+            log.info(
+                f"🔄 Forward — moderating the FORWARDER: "
+                f"id={sender_id} name={sender_name!r} "
+                f"(original sender: id={fwd['original_sender_id']} "
+                f"name={fwd['original_sender_name']!r})"
+            )
+
+        # Is the POSTER an admin of this chat?
         is_admin = await user_is_chat_admin(context.bot, chat.id, check_id)
 
         if is_admin:
@@ -1710,9 +1813,7 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     log.warning(f"Delete failed: {e}")
                     return
 
-    # Whitelist — only protects NON-admin messages.
-    # (Since we already returned for non-admins, this is moot here, but
-    # keeping it for safety / symmetry with older code.)
+    # Whitelist — only protects NON-admin messages (moot here)
     if text and not is_admin:
         for wl in await list_whitelist(chat.id):
             if keyword_matches(wl, text):
@@ -1724,7 +1825,7 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.info(f"✅ Approved admin — KEEPING (forwarded={fwd['is_forward']})")
         return
 
-    # Non-approved admin → DELETE (regardless of forward or original)
+    # Non-approved admin → DELETE
     if fwd["is_forward"]:
         reason = "forwarded post from non-approved admin"
     else:
@@ -1763,7 +1864,6 @@ async def delete_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
     chat_id = data["chat_id"]
 
-    # Re-check approval using the ORIGINAL sender
     approved = False
     if data.get("signature"):
         approved = await is_signature_approved(chat_id, data["signature"])
@@ -1941,9 +2041,8 @@ def main():
     log.info("  Admin Auto-Delete Bot — Starting")
     log.info("=" * 60)
 
-    if KEEP_ALIVE_ENABLED:
-        threading.Thread(target=run_health_server, daemon=True).start()
-        log.info(f"✅ Health server thread started on port {PORT}")
+    # Start Flask health server + internal self-pinger
+    start_keep_alive()
 
     try:
         loop = asyncio.new_event_loop()
